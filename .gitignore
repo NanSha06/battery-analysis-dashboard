@@ -1,1 +1,18 @@
-battery_digital_shadow_v2.zip
+```gitignore id="t3t5yb"
+# Large files
+*.zip
+*.pdf
+*.parquet
+*.mat
+
+# Project folders
+artifacts/
+
+# Python
+__pycache__/
+*.pyc
+
+# Environment
+.env
+venv/
+```
