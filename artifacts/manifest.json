@@ -15,6 +15,7 @@
   "battery_metrics_path": "artifacts\\battery_ecm_metrics.json",
   "battery_params_path": "artifacts\\battery_ecm_params.json",
   "scaling_metrics_path": "artifacts\\scaling_metrics.json",
+  "regime_stats_path": "artifacts\\regime_stats.json",
   "r0_validation_path": "artifacts\\r0_validation.json",
   "impedance_metrics_path": "artifacts\\impedance_metrics.json"
 }

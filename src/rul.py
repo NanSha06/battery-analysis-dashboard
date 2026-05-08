@@ -8,6 +8,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.model_selection import LeaveOneGroupOut
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
+from kneed import KneeLocator
+from scipy.optimize import curve_fit
 
 
 def fit_linear_degradation(cycle_index: np.ndarray, soh: np.ndarray) -> tuple[float, float]:
@@ -118,19 +120,94 @@ def fit_gpr_rul(discharge_df: pd.DataFrame, soh_threshold: float = 0.80) -> dict
     eol_p10    = eol_from_curve(soh_pred - 1.28 * soh_std)  # pessimistic
     eol_p90    = eol_from_curve(soh_pred + 1.28 * soh_std)  # optimistic
 
+    # --- Group 4 Monte Carlo RUL ---
+    n_samples = 500
+    # Use the covariance matrix for proper sampling if possible, 
+    # but instructed to use np.random.normal(soh_pred, soh_std)
+    # This assumes independent noise per future point, which is slightly different 
+    # than trajectory sampling but matches the prompt.
+    soh_samples = np.random.normal(
+        soh_pred.reshape(-1, 1), 
+        soh_std.reshape(-1, 1), 
+        size=(len(future_cycles), n_samples)
+    )
+    
+    mc_eols = []
+    for s in range(n_samples):
+        curve = soh_samples[:, s]
+        mc_eols.append(eol_from_curve(curve))
+    mc_eols = np.array(mc_eols)
+    
+    eol_mc_p5  = np.percentile(mc_eols, 5)
+    eol_mc_p25 = np.percentile(mc_eols, 25)
+    eol_mc_p75 = np.percentile(mc_eols, 75)
+    eol_mc_p95 = np.percentile(mc_eols, 95)
+
     current_cycles = df["cycle_index"].values
     rul_median = np.maximum(eol_median - current_cycles, 0)
     rul_p10    = np.maximum(eol_p10    - current_cycles, 0)
     rul_p90    = np.maximum(eol_p90    - current_cycles, 0)
+    
+    rul_mc_p5  = np.maximum(eol_mc_p5  - current_cycles, 0)
+    rul_mc_p25 = np.maximum(eol_mc_p25 - current_cycles, 0)
+    rul_mc_p75 = np.maximum(eol_mc_p75 - current_cycles, 0)
+    rul_mc_p95 = np.maximum(eol_mc_p95 - current_cycles, 0)
 
     return {
         "rul_median": rul_median,
         "rul_p10":    rul_p10,
         "rul_p90":    rul_p90,
+        "rul_mc_p5":  rul_mc_p5,
+        "rul_mc_p25": rul_mc_p25,
+        "rul_mc_p75": rul_mc_p75,
+        "rul_mc_p95": rul_mc_p95,
         "eol_median": eol_median,
-        "eol_p10":    eol_p10,
-        "eol_p90":    eol_p90,
     }
+
+
+def fit_arrhenius_rul(
+    cycle_index: np.ndarray,
+    soh: np.ndarray,
+    temp_c: np.ndarray,
+    soh_threshold: float = 0.8,
+) -> np.ndarray:
+    """
+    Fits Q_loss = A * exp(-Ea / (R * T)) * cycle^0.5
+    Returns estimated RUL array.
+    """
+    R = 8.314
+    T_k = np.asarray(temp_c, dtype=float) + 273.15
+    cycles = np.asarray(cycle_index, dtype=float)
+    y = 1.0 - np.asarray(soh, dtype=float)  # Q_loss
+    
+    mask = np.isfinite(cycles) & np.isfinite(y) & np.isfinite(T_k)
+    if mask.sum() < 5:
+        return np.full_like(cycle_index, np.nan, dtype=float)
+
+    def model_func(xdata, A, Ea):
+        c, t = xdata
+        return A * np.exp(-Ea / (R * t)) * np.sqrt(c)
+
+    try:
+        popt, _ = curve_fit(
+            model_func,
+            (cycles[mask], T_k[mask]),
+            y[mask],
+            p0=[1e-3, 20000],
+            bounds=(0, [1.0, 1e6])
+        )
+        A_fit, Ea_fit = popt
+        
+        # Project forward to find EOL
+        future = np.arange(1, 2000)
+        T_ref = np.mean(T_k[mask])
+        q_loss_pred = A_fit * np.exp(-Ea_fit / (R * T_ref)) * np.sqrt(future)
+        eol_idx = np.where(q_loss_pred >= (1.0 - soh_threshold))[0]
+        eol_cycle = future[eol_idx[0]] if len(eol_idx) else 1000
+        
+        return np.maximum(eol_cycle - cycles, 0)
+    except:
+        return np.full_like(cycle_index, np.nan, dtype=float)
 
 
 def fit_pooled_rul(all_battery_dfs: dict) -> dict:
@@ -198,6 +275,13 @@ def add_rul_estimates(
     frame["rul_cycles_gpr"] = np.nan
     frame["rul_p10"] = np.nan
     frame["rul_p90"] = np.nan
+    frame["rul_mc_p5"] = np.nan
+    frame["rul_mc_p25"] = np.nan
+    frame["rul_mc_p75"] = np.nan
+    frame["rul_mc_p95"] = np.nan
+    frame["rul_arrhenius"] = np.nan
+    frame["knee_cycle"] = np.nan
+    frame["post_knee_degradation_rate"] = np.nan
 
     discharge = frame[frame["cycle_type"] == "discharge"].copy()
     if discharge.empty or "soh" not in discharge:
@@ -233,5 +317,45 @@ def add_rul_estimates(
             frame.loc[mask, "rul_cycles_gpr"] = gpr_results["rul_median"]
             frame.loc[mask, "rul_p10"] = gpr_results["rul_p10"]
             frame.loc[mask, "rul_p90"] = gpr_results["rul_p90"]
+            frame.loc[mask, "rul_mc_p5"] = gpr_results["rul_mc_p5"]
+            frame.loc[mask, "rul_mc_p25"] = gpr_results["rul_mc_p25"]
+            frame.loc[mask, "rul_mc_p75"] = gpr_results["rul_mc_p75"]
+            frame.loc[mask, "rul_mc_p95"] = gpr_results["rul_mc_p95"]
+
+        # 3. Knee-point Detection
+        if len(group) > 20:
+            try:
+                kl = KneeLocator(group["cycle_index"].values, group["soh"].values, 
+                                 curve='concave', direction='decreasing')
+                if kl.knee:
+                    knee = int(kl.knee)
+                    frame.loc[mask, "knee_cycle"] = knee
+                    post_knee = group[group["cycle_index"] >= knee]
+                    if len(post_knee) > 5:
+                        slope, _ = fit_linear_degradation(post_knee["cycle_index"], post_knee["soh"])
+                        frame.loc[mask, "post_knee_degradation_rate"] = slope
+                        
+                        # Update RUL if past knee
+                        current_cycles = frame.loc[mask, "cycle_index"]
+                        past_knee_mask = (current_cycles >= knee)
+                        if past_knee_mask.any():
+                            # Intersection of current SOH with post-knee slope
+                            # y - y0 = m(x - x0) => 0.8 - soh = slope * (eol - cycle)
+                            # eol = cycle + (0.8 - soh) / slope
+                            current_soh = group.loc[past_knee_mask, "soh"]
+                            if abs(slope) > 1e-10:
+                                eol_past = current_cycles[past_knee_mask] + (soh_threshold - current_soh) / slope
+                                frame.loc[mask.values & past_knee_mask.values, "rul_cycles"] = np.maximum(eol_past - current_cycles[past_knee_mask], 0)
+            except:
+                pass
+
+        # 4. Arrhenius Model
+        if "temperature_mean_c" in group:
+            frame.loc[mask, "rul_arrhenius"] = fit_arrhenius_rul(
+                group["cycle_index"].values, 
+                group["soh"].values, 
+                group["temperature_mean_c"].values,
+                soh_threshold=soh_threshold
+            )
 
     return frame

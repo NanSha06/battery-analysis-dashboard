@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import cross_val_score
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 
 def optimise_soh_weights(cycle_df: pd.DataFrame) -> tuple[float, float]:
@@ -45,6 +47,14 @@ def add_cycle_features(cycle_table: pd.DataFrame, w1: float | None = None, w2: f
         frame["total_resistance_ohm"] = frame["re_ohm"] + frame["rct_ohm"]
     
     frame["re_rct_ratio"] = frame["re_ohm"] / frame["rct_ohm"].replace(0, np.nan)
+    
+    # Re/Rct slope per battery (discharge cycles)
+    frame["re_rct_slope"] = np.nan
+    for bid, group in frame[frame["cycle_type"] == "discharge"].groupby("battery_id"):
+        valid = group.dropna(subset=["re_rct_ratio", "cycle_index"])
+        if len(valid) > 2:
+            slope = np.polyfit(valid["cycle_index"], valid["re_rct_ratio"], 1)[0]
+            frame.loc[frame["battery_id"] == bid, "re_rct_slope"] = float(slope)
 
     if w1 is None or w2 is None:
         w1, w2 = optimise_soh_weights(frame)
@@ -220,10 +230,35 @@ def summarize_discharge_cycles(sample_table: pd.DataFrame) -> pd.DataFrame:
             temp_min_c=("temperature_c", "min"),
             temp_max_c=("temperature_c", "max"),
             current_mean_a=("current_a", "mean"),
+            discharge_soc_mean=("soc", "mean"),
+            dod=("soc", lambda x: float(x.max() - x.min())),
         )
     )
     summary["voltage_drop_v"] = summary["voltage_start_v"] - summary["voltage_end_v"]
     summary["temp_rise_c"] = summary["temp_max_c"] - summary["temp_min_c"]
+    return summary
+
+
+def summarize_charge_cycles(sample_table: pd.DataFrame) -> pd.DataFrame:
+    if sample_table.empty:
+        return pd.DataFrame()
+
+    charge = sample_table[sample_table["cycle_type"] == "charge"].copy()
+    if charge.empty:
+        return pd.DataFrame()
+    
+    if "soc" not in charge.columns:
+        charge["soc"] = np.nan
+
+    summary = (
+        charge.groupby(["battery_id", "cycle_index"], as_index=False)
+        .agg(
+            charge_duration_s=("time_s", lambda x: float(x.max() - x.min())),
+            charge_current_mean_a=("current_a", "mean"),
+            charge_temp_mean_c=("temperature_c", "mean"),
+            charge_soc_mean=("soc", "mean"),
+        )
+    )
     return summary
 
 
@@ -306,4 +341,34 @@ def compute_efficiency_trends(
             raw=True,
         )
     )
+    return frame
+
+
+def cluster_operating_regimes(cycle_df: pd.DataFrame, n_clusters: int = 3) -> pd.DataFrame:
+    """
+    Groups cycles into regimes based on operating conditions.
+    """
+    frame = cycle_df.copy()
+    discharge = frame[frame["cycle_type"] == "discharge"].copy()
+    
+    features = ["temperature_mean_c", "current_mean_a", "duration_s", "dod"]
+    # Ensure features exist
+    features = [f for f in features if f in discharge.columns]
+    
+    if len(discharge) < n_clusters or not features:
+        frame["operating_regime"] = 0
+        return frame
+        
+    X = discharge[features].fillna(discharge[features].median())
+    
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    clusters = kmeans.fit_predict(X_scaled)
+    
+    frame["operating_regime"] = np.nan
+    frame.loc[discharge.index, "operating_regime"] = clusters.astype(float)
+    frame["operating_regime"] = frame["operating_regime"].fillna(0).astype(int)
+    
     return frame

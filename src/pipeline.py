@@ -12,9 +12,13 @@ from .ecm import (
     attach_ecm_state,
     ekf_voltage_error_metrics,
     voltage_error_metrics,
+    interpolate_ocv,
 )
 from .state_estimators import build_shadow_state
 from .rul import fit_stress_coefficients, fit_pooled_rul
+from .features import cluster_operating_regimes
+from .recommendations import get_charge_recommendation
+from .calibration import compute_soh_calibration
 from .impedance_validation import (
     analyze_impedance_growth,
     process_battery_impedance,
@@ -65,6 +69,9 @@ def build_digital_shadow(
         soh_threshold=soh_threshold,
     )
 
+    # --- Group 3 Operating Regime ---
+    cycle_state = cluster_operating_regimes(cycle_state)
+
     ecm_input = sample_state
     if ecm_sample_limit is not None and len(sample_state) > ecm_sample_limit:
         ecm_input = sample_state.head(ecm_sample_limit).copy()
@@ -93,6 +100,14 @@ def build_digital_shadow(
                 "rul_cycles_gpr",
                 "rul_p10",
                 "rul_p90",
+                "rul_mc_p5",
+                "rul_mc_p25",
+                "rul_mc_p75",
+                "rul_mc_p95",
+                "rul_arrhenius",
+                "knee_cycle",
+                "post_knee_degradation_rate",
+                "operating_regime",
             ]
         ],
         on=["battery_id", "cycle_index"],
@@ -181,6 +196,20 @@ def export_dashboard_artifacts(result: dict[str, object], output_dir: str | Path
         r0_val_path.write_text(json.dumps(r0_val, indent=2), encoding="utf-8")
         paths["r0_validation"] = str(r0_val_path)
 
+    reg_stat = result.get("regime_stats", {})
+    if reg_stat:
+        reg_stat_path = output_dir / "regime_stats.json"
+        reg_stat_path.write_text(json.dumps(reg_stat, indent=2), encoding="utf-8")
+        paths["regime_stats"] = str(reg_stat_path)
+
+    # Export calibration artifacts
+    calibration_data = result.get("calibration", {})
+    for bid, cal_df in calibration_data.items():
+        if isinstance(cal_df, pd.DataFrame):
+            cal_path = output_dir / f"calibration_{bid}.parquet"
+            cal_df.to_parquet(cal_path, index=False)
+            paths[f"calibration_{bid}"] = str(cal_path)
+
     imp_met = result.get("impedance_metrics", {})
     if imp_met:
         imp_met_path = output_dir / "impedance_metrics.json"
@@ -206,6 +235,7 @@ def export_dashboard_artifacts(result: dict[str, object], output_dir: str | Path
         "battery_metrics_path": str(battery_metrics_path),
         "battery_params_path": str(battery_params_path),
         "scaling_metrics_path": str(s_met_path) if s_met else "",
+        "regime_stats_path": str(output_dir / "regime_stats.json") if "regime_stats" in paths else "",
     }
     if "r0_validation" in paths:
         manifest["r0_validation_path"] = paths["r0_validation"]
@@ -238,13 +268,14 @@ def build_and_export_dashboard_artifacts(
         battery_metrics: dict[str, dict[str, float]] = {}
         battery_params: dict[str, dict[str, float]] = {}
         all_batt_cycles: dict[str, pd.DataFrame] = {}
+        all_batt_ocv: dict[str, pd.DataFrame] = {}
 
         for battery_id, group in sample_state.groupby("battery_id"):
             ecm_input = group.copy()
             if ecm_sample_limit is not None and len(ecm_input) > ecm_sample_limit:
                 ecm_input = ecm_input.head(ecm_sample_limit).copy()
 
-            sample_shadow_battery, ecm_params_battery, _ = attach_ecm_state(
+            sample_shadow_battery, ecm_params_battery, ocv_curve_battery = attach_ecm_state(
                 ecm_input,
                 nominal_capacity_ah=nominal_capacity_ah,
             )
@@ -262,6 +293,14 @@ def build_and_export_dashboard_artifacts(
                         "rul_cycles_gpr",
                         "rul_p10",
                         "rul_p90",
+                        "rul_mc_p5",
+                        "rul_mc_p25",
+                        "rul_mc_p75",
+                        "rul_mc_p95",
+                        "rul_arrhenius",
+                        "knee_cycle",
+                        "post_knee_degradation_rate",
+                        "operating_regime",
                     ]
                 ],
                 on=["battery_id", "cycle_index"],
@@ -269,6 +308,7 @@ def build_and_export_dashboard_artifacts(
             )
             battery_frames.append(sample_shadow_battery)
             battery_params[battery_id] = asdict(ecm_params_battery)
+            all_batt_ocv[battery_id] = ocv_curve_battery
             metrics = voltage_error_metrics(sample_shadow_battery)
             metrics.update(ekf_voltage_error_metrics(sample_shadow_battery))
             battery_metrics[battery_id] = metrics
@@ -326,6 +366,31 @@ def build_and_export_dashboard_artifacts(
                 cycle_shadow.loc[battery_mask, "r2"] = float(params["r2"]) * (1.0 + 0.8 * resistance_scale)
                 cycle_shadow.loc[battery_mask, "c1"] = float(params["c1"]) * (1.0 - 0.5 * aging_scale)
                 cycle_shadow.loc[battery_mask, "c2"] = float(params["c2"]) * (1.0 - 0.3 * aging_scale)
+
+                # --- Group 1 Physics Features ---
+                battery_rows = cycle_shadow.loc[battery_mask].copy()
+                
+                # 1. State of Power (SOP)
+                # Use mean discharge SOC if available, else mean charge SOC, else 0.5
+                soc_sop = battery_rows["discharge_soc_mean"].fillna(battery_rows["charge_soc_mean"]).fillna(0.5).to_numpy()
+                batt_ocv = all_batt_ocv.get(battery_id, pd.DataFrame())
+                ocv_sop = interpolate_ocv(soc_sop, batt_ocv)
+                r_total = (battery_rows["r0"] + battery_rows["r1"] + battery_rows["r2"]).to_numpy(dtype=float)
+                v_min = 3.0
+                # SOP = ((V_min - OCV(SOC)) / (R0 + R1 + R2)) * V_min
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    sop_values = ((v_min - ocv_sop) / np.where(r_total > 1e-6, r_total, np.nan)) * v_min
+                cycle_shadow.loc[battery_mask, "sop_w"] = sop_values
+
+                # 2. Lithium Plating Risk Index
+                # plating_risk = clip((charge_rate_c / max(temperature_c, 1)) * (1 - soc), 0, 1)
+                charge_current = battery_rows["charge_current_mean_a"].fillna(0.0).to_numpy()
+                charge_rate_c = np.abs(charge_current) / nominal_capacity_ah
+                charge_temp = battery_rows["charge_temp_mean_c"].fillna(25.0).to_numpy()
+                charge_soc = battery_rows["charge_soc_mean"].fillna(0.0).to_numpy()
+                
+                risk = (charge_rate_c / np.maximum(charge_temp, 1.0)) * (1.0 - charge_soc)
+                cycle_shadow.loc[battery_mask, "plating_risk"] = np.clip(risk, 0.0, 1.0)
 
                 metrics = battery_metrics.get(battery_id, {})
                 cycle_shadow.loc[battery_mask, "cycle_ecm_mae_v"] = metrics.get("mae_v")
@@ -412,6 +477,33 @@ def build_and_export_dashboard_artifacts(
                 result["impedance_trend"] = pd.concat(trend_frames, ignore_index=True)
             else:
                 result["impedance_trend"] = pd.DataFrame(columns=["battery_id", "cycle_index", "impedance", "rolling_avg", "growth_rate", "anomaly"])
+                
+            # --- Group 3 Operating Regime Stats ---
+            regime_stats = {}
+            for regime, group in cycle_shadow[cycle_shadow["cycle_type"] == "discharge"].groupby("operating_regime"):
+                group = group.sort_values(["battery_id", "cycle_index"])
+                group["soh_diff"] = group.groupby("battery_id")["soh"].diff()
+                group["cycle_diff"] = group.groupby("battery_id")["cycle_index"].diff()
+                
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    rates = group["soh_diff"] / group["cycle_diff"]
+                
+                regime_stats[int(regime)] = {
+                    "mean_degradation_rate": float(rates.mean()),
+                    "std_degradation_rate": float(rates.std()),
+                    "mean_temperature": float(group["temperature_mean_c"].mean()),
+                    "mean_current": float(group["current_mean_a"].mean()),
+                    "cycle_count": int(len(group))
+                }
+            result["regime_stats"] = regime_stats
+            result["cycle_shadow"] = cycle_shadow # Update with regime labels
+            
+            # --- Group 4 Calibration ---
+            calibration_map = {}
+            for bid in battery_params.keys():
+                batt_cycles = cycle_shadow[cycle_shadow["battery_id"] == bid]
+                calibration_map[bid] = compute_soh_calibration(batt_cycles)
+            result["calibration"] = calibration_map
                 
             curve_cols = ["battery_id", "cycle_index", "r0_aligned", "estimated_impedance_ohm"]
             result["impedance_curve"] = cycle_shadow.dropna(subset=["r0_aligned", "estimated_impedance_ohm"])[curve_cols].rename(columns={"r0_aligned": "r0"}) if not cycle_shadow.empty else pd.DataFrame()

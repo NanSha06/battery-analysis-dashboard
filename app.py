@@ -30,6 +30,8 @@ from src.dashboard_data import (  # noqa: E402
 from src.ecm import ECMParameters, get_dynamic_params  # noqa: E402
 from src.features import compute_cycle_efficiency, compute_efficiency_trends  # noqa: E402
 from src.state_estimators import apply_soc_anchor  # noqa: E402
+from src.recommendations import get_charge_recommendation # noqa: E402
+from src.rul import add_rul_estimates # noqa: E402
 
 
 st.set_page_config(page_title="Li-ion Digital Shadow", layout="wide")
@@ -169,10 +171,26 @@ def get_global_data(artifact_dir: str) -> dict:
                 data["scaling_metrics"] = json.load(f)
         else:
             data["scaling_metrics"] = {}
+            
+        if "regime_stats_path" in manifest and manifest["regime_stats_path"]:
+            with open(manifest["regime_stats_path"], "r", encoding="utf-8") as f:
+                data["regime_stats"] = json.load(f)
+        else:
+            data["regime_stats"] = {}
+            
+        # Load calibration data per battery
+        data["calibration"] = {}
+        for bid in available_battery_ids(artifact_dir, table_kind="sample_shadow"):
+            cal_path = Path(artifact_dir) / f"calibration_{bid}.parquet"
+            if cal_path.exists():
+                data["calibration"][bid] = pd.read_parquet(cal_path)
+
     except Exception:
         data["r0_validation"] = {}
         data["impedance_metrics"] = {}
         data["scaling_metrics"] = {}
+        data["regime_stats"] = {}
+        data["calibration"] = {}
     return data
 
 
@@ -606,6 +624,55 @@ def build_physics_summary(physics_shadow: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def render_maintenance_panel(
+    summary: dict[str, float],
+    selected_battery: str,
+    battery_cycle_shadow: pd.DataFrame,
+) -> None:
+    # Get latest discharge cycle data
+    discharge = battery_cycle_shadow[battery_cycle_shadow["cycle_type"] == "discharge"].sort_values("cycle_index")
+    if discharge.empty:
+        return
+        
+    latest = discharge.iloc[-1]
+    rec = get_charge_recommendation(
+        soh=float(latest.get("soh", 1.0)),
+        rul_cycles=float(latest.get("rul_cycles", 100.0)),
+        temperature_mean_c=float(latest.get("temperature_mean_c", 25.0)),
+        plating_risk=float(latest.get("plating_risk", 0.0)),
+    )
+    
+    colors = {
+        "normal": "#3fb950",
+        "reduce_crate": "#d29922",
+        "reduce_voltage": "#d29922",
+        "inspect": "#f85149",
+        "replace": "#f85149",
+    }
+    actions = {
+        "normal": "NORMAL OPERATION",
+        "reduce_crate": "REDUCE CHARGE RATE",
+        "reduce_voltage": "REDUCE PEAK VOLTAGE",
+        "inspect": "DETAILED INSPECTION REQUIRED",
+        "replace": "REPLACEMENT RECOMMENDED",
+    }
+    
+    st.markdown(f"""
+    <div style="background: rgba(30,34,42,0.4); border: 1px solid {colors[rec['action']]}; border-left: 8px solid {colors[rec['action']]}; padding: 20px; border-radius: 12px; margin-bottom: 24px;">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <div style="font-size: 0.85rem; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">Maintenance Decision for {selected_battery}</div>
+                <div style="font-size: 1.5rem; font-weight: 700; color: #ffffff;">{actions[rec['action']]}</div>
+                <div style="font-size: 1rem; color: #c9d1d9; margin-top: 8px;">{rec['reason']}</div>
+            </div>
+            <div style="background: {colors[rec['action']]}; color: #ffffff; padding: 8px 16px; border-radius: 20px; font-weight: 700; font-size: 0.9rem;">
+                {rec['action'].replace('_', ' ').upper()}
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
 def render_kpi_cards(
     summary: dict[str, float],
     latest_soc: float,
@@ -733,6 +800,7 @@ def main() -> None:
     physics_shadow = add_physics_features(detail_shadow, ocv_curve, selected_ecm_params)
     efficiency_table = compute_efficiency_trends(compute_cycle_efficiency(detail_shadow))
 
+    render_maintenance_panel(summary, selected_battery, battery_cycle_shadow)
     render_kpi_cards(summary, latest_soc_value(detail_shadow), selected_battery, eol_summary)
 
     if run_meta:
@@ -945,6 +1013,28 @@ def main() -> None:
         fig.update_layout(title=f"RUL Projection & GPR Uncertainty: {selected_battery}",
                           xaxis_title="Cycle Index", yaxis_title="Remaining Cycles", height=500)
         st.plotly_chart(fig, use_container_width=True)
+        
+        # --- Group 5 What-if Simulation ---
+        with st.expander("🛠️ Stress Scenario What-if Simulation", expanded=False):
+            st.markdown("Simulate how changes in operating stress would affect the linear RUL projection.")
+            sim_cols = st.columns(2)
+            temp_adj = sim_cols[0].slider("Temperature Delta (°C)", -10.0, 10.0, 0.0, 1.0)
+            crate_adj = sim_cols[1].slider("C-Rate Scaling factor", 0.5, 2.0, 1.0, 0.1)
+            
+            sim_df = batt_rul.copy()
+            if "temperature_max_c" in sim_df.columns:
+                sim_df["temperature_max_c"] += temp_adj
+            # C-rate scaling affects current
+            if "current_mean_a" in sim_df.columns:
+                sim_df["current_mean_a"] *= crate_adj
+                
+            sim_df = add_rul_estimates(sim_df, soh_threshold=NASA_EOL_SOH)
+            
+            whatif_fig = go.Figure()
+            whatif_fig.add_trace(go.Scatter(x=batt_rul["cycle_index"], y=batt_rul["rul_cycles"], name="Baseline RUL", line=dict(color="#666")))
+            whatif_fig.add_trace(go.Scatter(x=sim_df["cycle_index"], y=sim_df["rul_cycles"], name="Simulated RUL", line=dict(color="#f85149", width=3)))
+            whatif_fig.update_layout(title="Stress Scenario Impact on RUL", xaxis_title="Cycle", yaxis_title="RUL (cycles)", height=400)
+            st.plotly_chart(whatif_fig, use_container_width=True)
 
     with ocv_tab:
         ocv_fig = px.line(ocv_curve, x="soc", y="ocv_v", title="OCV vs SOC")
@@ -1299,6 +1389,33 @@ def main() -> None:
             )
             st.plotly_chart(anom_fig, use_container_width=True)
             
+        # --- Group 5 Operating Regimes & Calibration ---
+        diag_grid = st.columns(2)
+        with diag_grid[0]:
+            st.markdown("#### Operating Regimes")
+            if "operating_regime" in battery_cycle_shadow.columns:
+                regime_df = battery_cycle_shadow[battery_cycle_shadow["cycle_type"] == "discharge"].copy()
+                regime_fig = px.scatter(
+                    regime_df, x="temperature_mean_c", y="current_mean_a", 
+                    color="operating_regime", size="dod",
+                    title="Discharge Conditions by Regime",
+                    labels={"temperature_mean_c": "Temp (°C)", "current_mean_a": "Current (A)"}
+                )
+                st.plotly_chart(regime_fig, use_container_width=True)
+            else:
+                st.info("Operating regime data not available.")
+
+        with diag_grid[1]:
+            st.markdown("#### SOH Model Calibration")
+            cal_df = global_data.get("calibration", {}).get(selected_battery)
+            if cal_df is not None and not cal_df.empty:
+                cal_fig = go.Figure()
+                cal_fig.add_trace(go.Scatter(x=cal_df["expected_coverage"], y=cal_df["coverage"], mode='markers+lines', name="Actual Coverage"))
+                cal_fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines', line=dict(dash='dash', color='gray'), name="Perfect Calibration"))
+                cal_fig.update_layout(title="90% CI Reliability Diagram", xaxis_title="Expected", yaxis_title="Observed", height=400)
+                st.plotly_chart(cal_fig, use_container_width=True)
+            else:
+                st.info("Calibration data not available for this battery.")
         with st.expander("Global & Battery ECM Metrics", expanded=False):
             diagnostics_cols = st.columns(2)
             diagnostics_cols[0].json(

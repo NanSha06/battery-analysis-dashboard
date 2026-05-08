@@ -8,3 +8,5 @@ streamlit
 plotly
 pyarrow
 pandera
+kneed
+pytest

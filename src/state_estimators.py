@@ -11,6 +11,7 @@ from .features import (
     add_sample_features,
     compute_cycle_efficiency,
     summarize_discharge_cycles,
+    summarize_charge_cycles,
 )
 from .rul import add_rul_estimates
 
@@ -153,6 +154,7 @@ def estimate_soh_regression(cycle_table: pd.DataFrame) -> tuple[pd.DataFrame, Ba
         "soh_lag_1",
         "soh_delta_1",
         "soh_rolling_var_10",
+        "dod",
     ]
     # Filter features that are actually present
     feature_cols = [c for c in feature_cols if c in discharge.columns]
@@ -174,6 +176,10 @@ def estimate_soh_regression(cycle_table: pd.DataFrame) -> tuple[pd.DataFrame, Ba
     
     X_all = discharge[feature_cols].fillna(0.0)
     soh_pred, soh_std = model.predict(X_all, return_std=True)
+    
+    # --- Group 4 Uncertainty Widening ---
+    # Multiply soh_std by (1 / soh_pred.clip(0.1, 1.0))
+    soh_std = soh_std * (1.0 / np.clip(soh_pred, 0.1, 1.0))
     
     frame["soh_model"] = np.nan
     frame["soh_model_pred"] = np.nan
@@ -210,14 +216,11 @@ def build_shadow_state(
     # 4. Temporal lag features
     cycle_state = add_lag_features(cycle_state)
     
-    # 5. SOH regression model
-    cycle_state, soh_model = estimate_soh_regression(cycle_state)
-    
+    # 5. Summaries (moved up for SOH features)
     cycle_state, sample_state = add_cycle_counters(cycle_state, sample_state)
+    
     discharge_summary = summarize_discharge_cycles(sample_state)
-
     if not discharge_summary.empty:
-        # Avoid duplicate columns during merge
         cols_to_use = [c for c in discharge_summary.columns if c not in cycle_state.columns or c in ["battery_id", "cycle_index"]]
         cycle_state = cycle_state.merge(
             discharge_summary[cols_to_use],
@@ -225,5 +228,17 @@ def build_shadow_state(
             how="left",
         )
 
+    charge_summary = summarize_charge_cycles(sample_state)
+    if not charge_summary.empty:
+        cols_to_use = [c for c in charge_summary.columns if c not in cycle_state.columns or c in ["battery_id", "cycle_index"]]
+        cycle_state = cycle_state.merge(
+            charge_summary[cols_to_use],
+            on=["battery_id", "cycle_index"],
+            how="left",
+        )
+
+    # 6. SOH regression model
+    cycle_state, soh_model = estimate_soh_regression(cycle_state)
+    
     cycle_state = add_rul_estimates(cycle_state, soh_threshold=soh_threshold)
     return cycle_state, sample_state, soh_model
