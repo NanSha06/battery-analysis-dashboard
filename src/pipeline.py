@@ -4,8 +4,8 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 from .data_loader import load_shadow_tables
 from .ecm import (
