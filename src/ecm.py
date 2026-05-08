@@ -226,6 +226,7 @@ def run_ekf_soc_ocv(
     frame = sample_table.copy().reset_index(drop=True)
 
     frame["soc_ekf"] = np.nan
+    frame["soc_ekf_std"] = np.nan
     frame["ocv_ekf_v"] = np.nan
     frame["v_rc1_ekf"] = np.nan
     frame["v_rc2_ekf"] = np.nan
@@ -258,11 +259,15 @@ def run_ekf_soc_ocv(
         )
 
         soc_out = np.zeros(len(group), dtype=float)
+        soc_std_out = np.zeros(len(group), dtype=float)
         ocv_out = np.zeros(len(group), dtype=float)
         v1_out = np.zeros(len(group), dtype=float)
         v2_out = np.zeros(len(group), dtype=float)
         v_out = np.zeros(len(group), dtype=float)
         residual_out = np.zeros(len(group), dtype=float)
+        
+        innovation_history = []
+        WARMUP = 50
 
         for i in range(len(group)):
             dt = max(float(dt_s[i]), 0.0)
@@ -290,17 +295,30 @@ def run_ekf_soc_ocv(
 
             ocv_pred = ocv_from_soc(x_pred[0], ocv_curve)
             dh_dsoc = ocv_slope_from_soc(x_pred[0], ocv_curve)
-            h = np.asarray([[ocv_pred - ik * params.r0 - x_pred[1] - x_pred[2]]], dtype=float)
+            h_val = float(ocv_pred - ik * params.r0 - x_pred[1] - x_pred[2])
             h_jacobian = np.asarray([[dh_dsoc, -1.0, -1.0]], dtype=float)
 
             if np.isfinite(voltage[i]):
-                innovation = np.asarray([[float(voltage[i])]], dtype=float) - h
+                innovation = float(voltage[i]) - h_val
+                innovation_history.append(innovation)
+                
+                # --- Adaptive EKF (Sage-Husa) ---
+                if len(innovation_history) > WARMUP:
+                    recent = np.array(innovation_history[-WARMUP:])
+                    R_adapted = float(np.var(recent) + (h_jacobian @ p_pred @ h_jacobian.T))
+                    r[0, 0] = max(R_adapted, 1e-6)
+                    
+                    # Scale Q proportionally
+                    q[0, 0] = max(r[0, 0] * 4e-4, 1e-8)
+                    q[1, 1] = max(r[0, 0] * 4e-3, 1e-7)
+                    q[2, 2] = max(r[0, 0] * 4e-3, 1e-7)
+
                 s = h_jacobian @ p_pred @ h_jacobian.T + r
                 k = p_pred @ h_jacobian.T @ np.linalg.pinv(s)
-                x = x_pred + (k @ innovation).reshape(-1)
+                x = x_pred + (k * innovation).reshape(-1)
                 x[0] = float(np.clip(x[0], 0.0, 1.0))
                 p = (np.eye(3) - k @ h_jacobian) @ p_pred
-                residual_value = float(innovation[0, 0])
+                residual_value = innovation
             else:
                 x = x_pred
                 p = p_pred
@@ -310,6 +328,7 @@ def run_ekf_soc_ocv(
             voltage_value = float(ocv_value - ik * params.r0 - x[1] - x[2])
 
             soc_out[i] = x[0]
+            soc_std_out[i] = float(np.sqrt(p[0, 0]))
             ocv_out[i] = ocv_value
             v1_out[i] = x[1]
             v2_out[i] = x[2]
@@ -317,6 +336,7 @@ def run_ekf_soc_ocv(
             residual_out[i] = residual_value
 
         frame.loc[idx, "soc_ekf"] = soc_out
+        frame.loc[idx, "soc_ekf_std"] = soc_std_out
         frame.loc[idx, "ocv_ekf_v"] = ocv_out
         frame.loc[idx, "v_rc1_ekf"] = v1_out
         frame.loc[idx, "v_rc2_ekf"] = v2_out

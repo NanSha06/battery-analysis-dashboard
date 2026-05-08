@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import BayesianRidge
 
-from .features import add_cycle_features, add_sample_features, summarize_discharge_cycles
+from .features import (
+    add_cycle_features,
+    add_cycle_shape_features,
+    add_lag_features,
+    add_sample_features,
+    compute_cycle_efficiency,
+    summarize_discharge_cycles,
+)
 from .rul import add_rul_estimates
 
 
@@ -123,8 +130,8 @@ def apply_soc_anchor(
     return frame
 
 
-def estimate_soh_regression(cycle_table: pd.DataFrame) -> tuple[pd.DataFrame, Ridge | None]:
-    frame = add_cycle_features(cycle_table)
+def estimate_soh_regression(cycle_table: pd.DataFrame) -> tuple[pd.DataFrame, BayesianRidge | None]:
+    frame = cycle_table.copy()
     discharge = frame[frame["cycle_type"] == "discharge"].copy()
     if discharge.empty:
         return frame, None
@@ -138,19 +145,42 @@ def estimate_soh_regression(cycle_table: pd.DataFrame) -> tuple[pd.DataFrame, Ri
         "total_resistance_ohm",
         "rct_delta",
         "re_delta",
+        "ic_median",
+        "v_discharge_slope",
+        "t80_frac",
+        "charge_discharge_asym",
+        "voltage_rolling_var",
+        "soh_lag_1",
+        "soh_delta_1",
+        "soh_rolling_var_10",
     ]
-    usable = discharge.dropna(subset=["soh"]).copy()
-    X = usable[feature_cols].fillna(0.0)
-    y = usable["soh"]
-
-    if len(usable) < 3:
+    # Filter features that are actually present
+    feature_cols = [c for c in feature_cols if c in discharge.columns]
+    
+    usable = discharge.dropna(subset=["soh"] + feature_cols).copy()
+    if len(usable) < 5:
         frame["soh_model"] = np.nan
         return frame, None
 
-    model = Ridge(alpha=1.0)
+    X = usable[feature_cols]
+    y = usable["soh"]
+
+    model = BayesianRidge()
     model.fit(X, y)
+    
+    X_all = discharge[feature_cols].fillna(0.0)
+    soh_pred, soh_std = model.predict(X_all, return_std=True)
+    
     frame["soh_model"] = np.nan
-    frame.loc[usable.index, "soh_model"] = model.predict(X)
+    frame["soh_model_pred"] = np.nan
+    frame["soh_model_lower"] = np.nan
+    frame["soh_model_upper"] = np.nan
+    
+    frame.loc[discharge.index, "soh_model"] = soh_pred
+    frame.loc[discharge.index, "soh_model_pred"] = soh_pred
+    frame.loc[discharge.index, "soh_model_lower"] = soh_pred - 1.65 * soh_std
+    frame.loc[discharge.index, "soh_model_upper"] = soh_pred + 1.65 * soh_std
+    
     return frame, model
 
 
@@ -159,15 +189,34 @@ def build_shadow_state(
     sample_table: pd.DataFrame,
     nominal_capacity_ah: float = 2.0,
     soh_threshold: float = 0.8,
-) -> tuple[pd.DataFrame, pd.DataFrame, Ridge | None]:
+) -> tuple[pd.DataFrame, pd.DataFrame, BayesianRidge | None]:
     sample_state = estimate_soc_coulomb_counting(sample_table, nominal_capacity_ah=nominal_capacity_ah)
-    cycle_state, soh_model = estimate_soh_regression(cycle_table)
+    
+    # 1. Basic cycle features and SOH fusion
+    cycle_state = add_cycle_features(cycle_table)
+    
+    # 2. Add efficiency
+    efficiency = compute_cycle_efficiency(sample_state)
+    if not efficiency.empty:
+        cycle_state = cycle_state.merge(efficiency, on=["battery_id", "cycle_index"], how="left")
+    
+    # 3. Shape features from sample data
+    cycle_state = add_cycle_shape_features(cycle_state, sample_state)
+    
+    # 4. Temporal lag features
+    cycle_state = add_lag_features(cycle_state)
+    
+    # 5. SOH regression model
+    cycle_state, soh_model = estimate_soh_regression(cycle_state)
+    
     cycle_state, sample_state = add_cycle_counters(cycle_state, sample_state)
     discharge_summary = summarize_discharge_cycles(sample_state)
 
     if not discharge_summary.empty:
+        # Avoid duplicate columns during merge
+        cols_to_use = [c for c in discharge_summary.columns if c not in cycle_state.columns or c in ["battery_id", "cycle_index"]]
         cycle_state = cycle_state.merge(
-            discharge_summary,
+            discharge_summary[cols_to_use],
             on=["battery_id", "cycle_index"],
             how="left",
         )

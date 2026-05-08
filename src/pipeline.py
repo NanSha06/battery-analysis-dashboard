@@ -13,12 +13,42 @@ from .ecm import (
     ekf_voltage_error_metrics,
     voltage_error_metrics,
 )
+from .state_estimators import build_shadow_state
+from .rul import fit_stress_coefficients, fit_pooled_rul
 from .impedance_validation import (
     analyze_impedance_growth,
     process_battery_impedance,
     validate_r0,
+    detect_multivariate_anomalies,
 )
-from .state_estimators import build_shadow_state
+
+
+CACHE_DIR = Path("artifacts/cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_cache_key(battery_id: str, cycle_index: int) -> Path:
+    return CACHE_DIR / f"{battery_id}_cycle_{cycle_index:04d}.parquet"
+
+
+def compute_cycle_features(battery_id: str, cycle_index: int, cycle_data: pd.DataFrame, sample_data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Placeholder for the per-cycle processing logic. 
+    This will be expanded as we integrate more features.
+    """
+    # For now, just return the sample data for this cycle
+    # In a real implementation, this would include EKF, SOC estimation, etc.
+    return sample_data.copy()
+
+
+def load_or_compute_cycle(battery_id: str, cycle_index: int, cycle_data: pd.DataFrame, sample_data: pd.DataFrame) -> pd.DataFrame:
+    cache_path = get_cache_key(battery_id, cycle_index)
+    if cache_path.exists():
+        return pd.read_parquet(cache_path)
+
+    result = compute_cycle_features(battery_id, cycle_index, cycle_data, sample_data)
+    result.to_parquet(cache_path, index=False)
+    return result
 
 
 def build_digital_shadow(
@@ -83,7 +113,7 @@ def export_shadow_tables(result: dict[str, object], output_dir: str | Path) -> N
     for key in ("cycle_table", "sample_table", "cycle_shadow", "sample_shadow", "ocv_curve"):
         value = result.get(key)
         if isinstance(value, pd.DataFrame):
-            value.to_csv(output_dir / f"{key}.csv", index=False)
+            value.to_csv(output_dir / f"{key}.csv", index=False, encoding="utf-8")
 
 
 def export_dashboard_artifacts(result: dict[str, object], output_dir: str | Path) -> dict[str, str]:
@@ -201,6 +231,7 @@ def build_and_export_dashboard_artifacts(
         battery_frames: list[pd.DataFrame] = []
         battery_metrics: dict[str, dict[str, float]] = {}
         battery_params: dict[str, dict[str, float]] = {}
+        all_batt_cycles: dict[str, pd.DataFrame] = {}
 
         for battery_id, group in sample_state.groupby("battery_id"):
             ecm_input = group.copy()
@@ -221,6 +252,14 @@ def build_and_export_dashboard_artifacts(
             metrics = voltage_error_metrics(sample_shadow_battery)
             metrics.update(ekf_voltage_error_metrics(sample_shadow_battery))
             battery_metrics[battery_id] = metrics
+            all_batt_cycles[battery_id] = cycle_shadow[cycle_shadow["battery_id"] == battery_id]
+
+        # 1. Fit Global Stress Coefficients & Pooled RUL
+        stress_coeffs = fit_stress_coefficients(all_batt_cycles)
+        pooled_rul = fit_pooled_rul(all_batt_cycles)
+        
+        # 2. Multivariate Anomaly Detection
+        cycle_shadow["anomaly"] = detect_multivariate_anomalies(cycle_shadow)
 
         if battery_frames:
             result["sample_shadow"] = pd.concat(battery_frames, ignore_index=True)
@@ -344,6 +383,10 @@ def build_and_export_dashboard_artifacts(
             result["r0_validation"] = r0_validation
             result["impedance_metrics"] = impedance_metrics
             result["scaling_metrics"] = scaling_metrics
+            result["global_models"] = {
+                "stress_coeffs": stress_coeffs,
+                "pooled_rul_r2": pooled_rul.get("loco_r2", []),
+            }
             
             if trend_frames:
                 result["impedance_trend"] = pd.concat(trend_frames, ignore_index=True)

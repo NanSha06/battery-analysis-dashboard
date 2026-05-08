@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+import json
+import hashlib
+import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +47,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def write_run_metadata(config: dict, metrics: dict, artifact_dir: Path):
+    run_id = hashlib.md5(
+        json.dumps(config, sort_keys=True).encode()
+    ).hexdigest()[:8]
+
+    metadata = {
+        "run_id":     run_id,
+        "timestamp":  datetime.datetime.utcnow().isoformat(),
+        "config":     config,
+        "metrics":    metrics,
+    }
+
+    out_path = artifact_dir / f"run_{run_id}.json"
+    out_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    # Also save as latest_run.json for easy access by app.py
+    (artifact_dir / "latest_run.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    print(f"[pipeline] Run metadata saved -> {out_path}")
+
+
 def main() -> None:
     args = parse_args()
     paths = build_and_export_dashboard_artifacts(
@@ -53,6 +75,18 @@ def main() -> None:
         soh_threshold=args.soh_threshold,
         ecm_sample_limit=args.ecm_sample_limit,
     )
+    
+    # Write run metadata
+    config = {
+        "nominal_capacity_ah": args.nominal_capacity_ah,
+        "soh_threshold": args.soh_threshold,
+        "ecm_sample_limit": args.ecm_sample_limit,
+        "mat_dir": str(args.mat_dir),
+    }
+    # Placeholder metrics; in a full impl, we'd pull these from the 'paths' artifacts
+    metrics = {"status": "success", "artifact_count": len(paths)}
+    write_run_metadata(config, metrics, Path(args.output_dir))
+
     print("Wrote dashboard artifacts:")
     for key, path in sorted(paths.items()):
         print(f"{key}: {path}")

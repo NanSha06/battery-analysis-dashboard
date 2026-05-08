@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.ensemble import IsolationForest
 from scipy.stats import pearsonr
 
 def detect_current_pulses(current: np.ndarray | pd.Series, threshold: float = 0.5) -> np.ndarray:
@@ -167,3 +168,37 @@ def process_battery_impedance(sample_table: pd.DataFrame) -> pd.DataFrame:
             })
             
     return pd.DataFrame(results)
+
+
+ANOMALY_FEATURES = [
+    "estimated_impedance_ohm",  # transient impedance
+    "soh",                      # state of health
+    "temperature_mean_c",       # thermal stress
+    "coulombic_efficiency",     # efficiency signal
+    "total_resistance_ohm",     # DC resistance
+]
+
+
+def detect_multivariate_anomalies(cycle_df: pd.DataFrame, contamination: float = 0.05) -> pd.Series:
+    """
+    Returns a boolean Series indexed like cycle_df: True = anomaly.
+    contamination=0.05 flags ~5% of cycles as anomalous.
+    """
+    if cycle_df.empty:
+        return pd.Series([], dtype=bool)
+
+    # Filter only existing features
+    present_features = [f for f in ANOMALY_FEATURES if f in cycle_df.columns]
+    feat_df = cycle_df[present_features].dropna()
+    
+    if len(feat_df) < 20:
+        return pd.Series(False, index=cycle_df.index)
+
+    clf = IsolationForest(
+        n_estimators=100,
+        contamination=contamination,
+        random_state=42,
+    )
+    preds = clf.fit_predict(feat_df.values)   # -1 = anomaly, 1 = normal
+    anomaly_mask = pd.Series(preds == -1, index=feat_df.index)
+    return anomaly_mask.reindex(cycle_df.index, fill_value=False)

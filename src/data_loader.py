@@ -7,6 +7,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import pandera as pa
+from pandera import Column, DataFrameSchema, Check
 from scipy.io import loadmat
 
 
@@ -169,6 +171,7 @@ def build_cycle_table(datasets: dict[str, BatteryDataset]) -> pd.DataFrame:
                     "capacity_ah": _to_scalar(data.get("Capacity")),
                     "re_ohm": _to_scalar(data.get("Re")),
                     "rct_ohm": _to_scalar(data.get("Rct")),
+                    "total_resistance_ohm": float((_to_scalar(data.get("Re")) or 0.0) + (_to_scalar(data.get("Rct")) or 0.0)),
                     "voltage_min_v": float(np.min(voltage)) if len(voltage) else np.nan,
                     "voltage_max_v": float(np.max(voltage)) if len(voltage) else np.nan,
                     "current_mean_a": float(np.mean(current)) if len(current) else np.nan,
@@ -223,8 +226,53 @@ def build_sample_table(datasets: dict[str, BatteryDataset]) -> pd.DataFrame:
     return sample_table
 
 
+CYCLE_SCHEMA = DataFrameSchema({
+    "cycle_index":           Column(int,   Check.ge(0)),
+    "cycle_type":            Column(str,   Check.isin(["charge", "discharge", "impedance"])),
+    "capacity_ah":           Column(float, Check.ge(0),   nullable=True),
+    "temperature_mean_c":    Column(float, Check.between(-20, 80), nullable=True),
+    "total_resistance_ohm":  Column(float, Check.ge(0),   nullable=True),
+})
+
+SAMPLE_SCHEMA = DataFrameSchema({
+    "cycle_index":  Column(int,   Check.ge(0)),
+    "voltage_v":    Column(float, Check.between(0, 5)),
+    "current_a":    Column(float, Check.between(-10, 10)),
+    "temperature_c":Column(float, Check.between(-20, 80), nullable=True),
+})
+
+
+def validate_tables(cycle_table: pd.DataFrame, sample_table: pd.DataFrame, battery_id: str = "Batch") -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Validates tables and drops invalid rows.
+    """
+    try:
+        clean_cycle = CYCLE_SCHEMA.validate(cycle_table, lazy=True)
+    except (pa.errors.SchemaError, pa.errors.SchemaErrors) as err:
+        print(f"[{battery_id}] Cycle table has validation violations. Dropping invalid rows.")
+        if hasattr(err, "failure_cases"):
+            clean_cycle = cycle_table.drop(err.failure_cases.index, errors="ignore")
+        else:
+            clean_cycle = cycle_table.dropna() # Fallback
+
+    try:
+        clean_sample = SAMPLE_SCHEMA.validate(sample_table, lazy=True)
+    except (pa.errors.SchemaError, pa.errors.SchemaErrors) as err:
+        print(f"[{battery_id}] Sample table has validation violations. Dropping invalid rows.")
+        if hasattr(err, "failure_cases"):
+            invalid_indices = err.failure_cases["index"].dropna().unique()
+            clean_sample = sample_table.drop(invalid_indices, errors="ignore")
+        else:
+            clean_sample = sample_table.dropna(subset=["voltage_v", "current_a"])
+
+    return clean_cycle, clean_sample
+
+
 def load_shadow_tables(mat_dir: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     datasets = load_all_batteries(mat_dir)
     cycle_table = build_cycle_table(datasets)
     sample_table = build_sample_table(datasets)
+    
+    cycle_table, sample_table = validate_tables(cycle_table, sample_table)
+    
     return cycle_table, sample_table

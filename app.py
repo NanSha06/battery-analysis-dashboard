@@ -155,17 +155,17 @@ def get_global_data(artifact_dir: str) -> dict:
         manifest = load_manifest(artifact_dir)
         import json
         if "r0_validation_path" in manifest:
-            with open(manifest["r0_validation_path"], "r") as f:
+            with open(manifest["r0_validation_path"], "r", encoding="utf-8") as f:
                 data["r0_validation"] = json.load(f)
         else:
             data["r0_validation"] = {}
         if "impedance_metrics_path" in manifest:
-            with open(manifest["impedance_metrics_path"], "r") as f:
+            with open(manifest["impedance_metrics_path"], "r", encoding="utf-8") as f:
                 data["impedance_metrics"] = json.load(f)
         else:
             data["impedance_metrics"] = {}
         if "scaling_metrics_path" in manifest and manifest["scaling_metrics_path"]:
-            with open(manifest["scaling_metrics_path"], "r") as f:
+            with open(manifest["scaling_metrics_path"], "r", encoding="utf-8") as f:
                 data["scaling_metrics"] = json.load(f)
         else:
             data["scaling_metrics"] = {}
@@ -174,6 +174,15 @@ def get_global_data(artifact_dir: str) -> dict:
         data["impedance_metrics"] = {}
         data["scaling_metrics"] = {}
     return data
+
+
+@st.cache_data(show_spinner=False)
+def get_run_metadata(artifact_dir: str) -> dict:
+    import json
+    path = Path(artifact_dir) / "latest_run.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    return {}
 
 
 @st.cache_data(show_spinner=False)
@@ -650,6 +659,10 @@ def render_kpi_cards(
 </div>"""
     grid_html += '</div>'
     st.markdown(grid_html, unsafe_allow_html=True)
+    
+    # Anomaly Alert
+    if "anomaly" in summary and summary["anomaly"] > 0:
+        st.warning(f"⚠️ {int(summary['anomaly'])} anomalous cycles detected in this battery's history.")
 
 
 def main() -> None:
@@ -662,6 +675,7 @@ def main() -> None:
         manifest = get_manifest(artifact_dir)
         global_data = get_global_data(artifact_dir)
         battery_ids = get_battery_ids(artifact_dir)
+        run_meta = get_run_metadata(artifact_dir)
     except FileNotFoundError:
         st.error(
             "Dashboard artifacts were not found. Run "
@@ -720,6 +734,10 @@ def main() -> None:
     efficiency_table = compute_efficiency_trends(compute_cycle_efficiency(detail_shadow))
 
     render_kpi_cards(summary, latest_soc_value(detail_shadow), selected_battery, eol_summary)
+
+    if run_meta:
+        with st.expander("🚀 Run Metadata", expanded=False):
+            st.json(run_meta)
 
     st.caption(
         "`cycle_type` tags each row as `charge`, `discharge`, or `impedance`. "
@@ -854,24 +872,79 @@ def main() -> None:
         st.plotly_chart(eol_fig, use_container_width=True)
 
     with soh_tab:
-        summary_fig = px.line(
-            cycle_shadow[cycle_shadow["cycle_type"] == "discharge"],
-            x="cycle_index",
-            y="soh",
-            color="battery_id",
-            title="SOH Degradation Across Batteries",
-        )
-        st.plotly_chart(summary_fig, use_container_width=True)
+        discharge_cycles = cycle_shadow[cycle_shadow["cycle_type"] == "discharge"].copy()
+        batt_soh = discharge_cycles[discharge_cycles["battery_id"] == selected_battery].copy()
+        
+        fig = go.Figure()
+        
+        # Uncertainty Band
+        if "soh_model_upper" in batt_soh.columns and "soh_model_lower" in batt_soh.columns:
+            fig.add_trace(go.Scatter(
+                x=pd.concat([batt_soh["cycle_index"], batt_soh["cycle_index"][::-1]]),
+                y=pd.concat([batt_soh["soh_model_upper"], batt_soh["soh_model_lower"][::-1]]),
+                fill='toself',
+                fillcolor='rgba(37, 99, 235, 0.2)',
+                line_color='rgba(255,255,255,0)',
+                showlegend=False,
+                name="SOH 90% CI",
+            ))
+            
+        fig.add_trace(go.Scatter(
+            x=batt_soh["cycle_index"],
+            y=batt_soh["soh"],
+            mode='lines+markers',
+            name="Observed SOH",
+            line=dict(color="#2563eb", width=2)
+        ))
+        
+        if "soh_model_pred" in batt_soh.columns:
+            fig.add_trace(go.Scatter(
+                x=batt_soh["cycle_index"],
+                y=batt_soh["soh_model_pred"],
+                mode='lines',
+                name="Bayesian Model",
+                line=dict(color="#60a5fa", width=2, dash='dash')
+            ))
+            
+        fig.update_layout(title=f"SOH Degradation & Bayesian Uncertainty: {selected_battery}",
+                          xaxis_title="Cycle Index", yaxis_title="SOH", height=500)
+        st.plotly_chart(fig, use_container_width=True)
 
     with rul_tab:
-        rul_fig = px.line(
-            cycle_shadow[cycle_shadow["cycle_type"] == "discharge"],
-            x="cycle_index",
-            y="rul_cycles",
-            color="battery_id",
-            title="Projected RUL Across Batteries",
-        )
-        st.plotly_chart(rul_fig, use_container_width=True)
+        batt_rul = discharge_cycles[discharge_cycles["battery_id"] == selected_battery].copy()
+        fig = go.Figure()
+        
+        if "rul_p90" in batt_rul.columns and "rul_p10" in batt_rul.columns:
+            fig.add_trace(go.Scatter(
+                x=pd.concat([batt_rul["cycle_index"], batt_rul["cycle_index"][::-1]]),
+                y=pd.concat([batt_rul["rul_p90"], batt_rul["rul_p10"][::-1]]),
+                fill='toself',
+                fillcolor='rgba(15, 118, 110, 0.2)',
+                line_color='rgba(255,255,255,0)',
+                showlegend=False,
+                name="RUL 80% CI",
+            ))
+            
+        fig.add_trace(go.Scatter(
+            x=batt_rul["cycle_index"],
+            y=batt_rul["rul_cycles"],
+            mode='lines',
+            name="Linear RUL",
+            line=dict(color="#0f766e", width=2)
+        ))
+        
+        if "rul_cycles_gpr" in batt_rul.columns:
+            fig.add_trace(go.Scatter(
+                x=batt_rul["cycle_index"],
+                y=batt_rul["rul_cycles_gpr"],
+                mode='lines',
+                name="GPR Median RUL",
+                line=dict(color="#2dd4bf", width=2, dash='dot')
+            ))
+            
+        fig.update_layout(title=f"RUL Projection & GPR Uncertainty: {selected_battery}",
+                          xaxis_title="Cycle Index", yaxis_title="Remaining Cycles", height=500)
+        st.plotly_chart(fig, use_container_width=True)
 
     with ocv_tab:
         ocv_fig = px.line(ocv_curve, x="soc", y="ocv_v", title="OCV vs SOC")
@@ -1214,6 +1287,18 @@ def main() -> None:
 
     with diagnostics_tab:
         st.markdown("### Technical Diagnostics Logs")
+        
+        # Anomaly Visualization
+        st.markdown("#### Multivariate Anomaly Scores")
+        if "anomaly" in battery_cycle_shadow.columns:
+            anom_df = battery_cycle_shadow[battery_cycle_shadow["cycle_type"] == "discharge"].copy()
+            anom_fig = px.scatter(
+                anom_df, x="cycle_index", y="soh", color="anomaly",
+                color_discrete_map={True: "red", False: "#2563eb"},
+                title="SOH with Flagged Anomalies (Isolation Forest)",
+            )
+            st.plotly_chart(anom_fig, use_container_width=True)
+            
         with st.expander("Global & Battery ECM Metrics", expanded=False):
             diagnostics_cols = st.columns(2)
             diagnostics_cols[0].json(

@@ -2,15 +2,52 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import cross_val_score
 
 
-def add_cycle_features(cycle_table: pd.DataFrame, w1: float = 0.8, w2: float = 0.2) -> pd.DataFrame:
+def optimise_soh_weights(cycle_df: pd.DataFrame) -> tuple[float, float]:
+    """
+    Find (w1, w2) that maximise correlation between fused SOH and
+    measured capacity ratio on discharge cycles.
+    Returns (w1, w2) with w1 + w2 = 1.
+    """
+    discharge = cycle_df[cycle_df["cycle_type"] == "discharge"].dropna(
+        subset=["capacity_ah", "total_resistance_ohm"]
+    ).copy()
+    
+    if len(discharge) < 5:
+        return 0.8, 0.2
+
+    C0 = discharge["capacity_ah"].iloc[0]
+    R0 = discharge["total_resistance_ohm"].iloc[0]
+    cap_ratio = discharge["capacity_ah"] / C0
+    res_ratio = R0 / discharge["total_resistance_ohm"]
+    target = cap_ratio  # ground truth: pure capacity ratio
+
+    best_score, best_w1 = -np.inf, 0.8
+    for w1 in np.arange(0.5, 1.0, 0.05):
+        w2 = 1.0 - w1
+        fused = w1 * cap_ratio + w2 * res_ratio
+        score = np.corrcoef(fused, target)[0, 1]
+        if score > best_score:
+            best_score, best_w1 = score, w1
+
+    return float(best_w1), round(float(1.0 - best_w1), 2)
+
+
+def add_cycle_features(cycle_table: pd.DataFrame, w1: float | None = None, w2: float | None = None) -> pd.DataFrame:
     if cycle_table.empty:
         return cycle_table.copy()
 
     frame = cycle_table.copy()
-    frame["total_resistance_ohm"] = frame["re_ohm"] + frame["rct_ohm"]
+    if "total_resistance_ohm" not in frame.columns:
+        frame["total_resistance_ohm"] = frame["re_ohm"] + frame["rct_ohm"]
+    
     frame["re_rct_ratio"] = frame["re_ohm"] / frame["rct_ohm"].replace(0, np.nan)
+
+    if w1 is None or w2 is None:
+        w1, w2 = optimise_soh_weights(frame)
 
     initial_capacity = (
         frame.loc[frame["cycle_type"] == "discharge"]
@@ -32,11 +69,122 @@ def add_cycle_features(cycle_table: pd.DataFrame, w1: float = 0.8, w2: float = 0
     resistance_norm = resistance_norm.fillna(1.0)
     
     frame.loc[discharge_mask, "soh"] = w1 * capacity_norm + w2 * resistance_norm
+    frame["soh_w1"] = w1
+    frame["soh_w2"] = w2
 
     frame["rct_delta"] = frame.groupby("battery_id")["rct_ohm"].diff()
     frame["re_delta"] = frame.groupby("battery_id")["re_ohm"].diff()
     frame["temperature_rise_c"] = frame["temperature_max_c"] - frame["temperature_mean_c"]
     return frame
+
+
+def add_cycle_shape_features(cycle_df: pd.DataFrame, sample_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds per-cycle shape features computed from raw sample vectors.
+    Merge result onto cycle_df on 'cycle_index'.
+    """
+    records = []
+    # Ensure columns exist before grouping
+    if "cycle_index" not in sample_df.columns or "time_s" not in sample_df.columns:
+        return cycle_df.copy()
+
+    for (battery_id, cycle_id), grp in sample_df.groupby(["battery_id", "cycle_index"]):
+        grp = grp.sort_values("time_s")
+        V = grp["voltage_v"].values
+        I = grp["current_a"].values
+        
+        # 1. dV/dQ — incremental capacity; use median of non-zero-Q region
+        # Q_cumulative in Ah
+        dt = np.diff(grp["time_s"].values, prepend=grp["time_s"].iloc[0])
+        dq_vec = np.abs(I) * dt / 3600.0
+        Q_cumulative = np.cumsum(dq_vec)
+
+        dq = np.diff(Q_cumulative)
+        dv = np.diff(V)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            dvdq = np.where(np.abs(dq) > 1e-6, dv / dq, np.nan)
+        ic_median = float(np.nanmedian(dvdq)) if not np.all(np.isnan(dvdq)) else np.nan
+
+        # 2. Voltage discharge slope (linear fit slope over discharge period)
+        discharge_mask = I < -0.05
+        if discharge_mask.sum() > 5:
+            v_slope = float(np.polyfit(np.where(discharge_mask)[0], V[discharge_mask], 1)[0])
+        else:
+            v_slope = np.nan
+
+        # 3. Time to reach 80% capacity cutoff (fraction of cycle duration)
+        total_Q = Q_cumulative[-1]
+        if total_Q > 0:
+            idx_80 = np.searchsorted(Q_cumulative, 0.8 * total_Q)
+            duration = grp["time_s"].iloc[-1] - grp["time_s"].iloc[0]
+            if duration > 0:
+                t80_frac = float((grp["time_s"].iloc[min(idx_80, len(grp)-1)] - grp["time_s"].iloc[0]) / duration)
+            else:
+                t80_frac = np.nan
+        else:
+            t80_frac = np.nan
+
+        # 4. Charge–discharge duration asymmetry ratio
+        charge_time    = grp.loc[grp["current_a"] > 0.05, "time_s"].count()
+        discharge_time = grp.loc[grp["current_a"] < -0.05, "time_s"].count()
+        asym_ratio = (
+            float(charge_time / discharge_time)
+            if discharge_time > 0 else np.nan
+        )
+
+        # 5. Rolling variance of voltage (within cycle) — captures noise growth
+        v_rolling_var = float(pd.Series(V).rolling(10).var().mean())
+
+        records.append({
+            "battery_id":     battery_id,
+            "cycle_index":    cycle_id,
+            "ic_median":      ic_median,
+            "v_discharge_slope": v_slope,
+            "t80_frac":       t80_frac,
+            "charge_discharge_asym": asym_ratio,
+            "voltage_rolling_var":   v_rolling_var,
+        })
+
+    if not records:
+        return cycle_df.copy()
+        
+    shape_df = pd.DataFrame(records)
+    return cycle_df.merge(shape_df, on=["battery_id", "cycle_index"], how="left")
+
+
+def add_lag_features(cycle_df: pd.DataFrame, lags: list[int] = [1, 3, 5, 10]) -> pd.DataFrame:
+    """
+    Appends lag and rolling features for SOH and Coulombic efficiency.
+    Only computed on discharge cycles; NaN-filled for others.
+    """
+    if cycle_df.empty:
+        return cycle_df.copy()
+        
+    df = cycle_df.copy().sort_values(["battery_id", "cycle_index"])
+    discharge_mask = df["cycle_type"] == "discharge"
+
+    for lag in lags:
+        df.loc[discharge_mask, f"soh_lag_{lag}"] = (
+            df.loc[discharge_mask].groupby("battery_id")["soh"].shift(lag)
+        )
+        if "coulombic_efficiency" in df.columns:
+            df.loc[discharge_mask, f"ce_lag_{lag}"] = (
+                df.loc[discharge_mask].groupby("battery_id")["coulombic_efficiency"].shift(lag)
+            )
+
+    # Rolling variance of SOH (momentum signal)
+    df.loc[discharge_mask, "soh_rolling_var_10"] = (
+        df.loc[discharge_mask].groupby("battery_id")["soh"]
+          .transform(lambda x: x.rolling(window=10, min_periods=3).var())
+    )
+
+    # Cycle-over-cycle SOH delta
+    df.loc[discharge_mask, "soh_delta_1"] = (
+        df.loc[discharge_mask].groupby("battery_id")["soh"].diff(1)
+    )
+
+    return df
+
 
 def add_sample_features(sample_table: pd.DataFrame) -> pd.DataFrame:
     if sample_table.empty:
