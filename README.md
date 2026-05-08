@@ -43,12 +43,65 @@ python scripts/prepare_dashboard_data.py --mat-dir mat_files --output-dir artifa
 streamlit run app.py
 ```
 
-## 🛠️ Infrastructure (V3 Upgrades)
-- **Fleet Safety Audit CLI:** `python scripts/safety_audit.py` for automated risk reporting.
-- **Physics-Informed Unit Tests:** Automated validation of SOP and Arrhenius logic via `pytest`.
-- **Cycle-Level Caching:** Parquet-based caching reduces incremental run times by >80%.
-- **Experiment Tracking:** Automated run metadata and configuration hashing for reproducibility.
-- **Cross-Platform Robustness:** Full UTF-8 support and environment configuration for Windows stability.
+## 📋 Data Format Specifications
+
+The platform supports multiple ingestion formats. Data should be placed in the `mat_files/` directory (or as configured in `config.yaml`).
+
+### 1. NASA .mat (Legacy)
+Standard NASA Prognostics Data Repository format. The pipeline automatically extracts cycles, temperatures, and impedances.
+
+### 2. JSON Format
+JSON files should follow this structure:
+```json
+{
+  "battery_id": "B0005",
+  "cycles": [
+    {
+      "cycle_index": 0,
+      "cycle_type": "discharge",
+      "data": {
+        "Time": [0, 1, 2],
+        "Voltage_measured": [4.2, 4.1, 4.0],
+        "Current_measured": [-1, -1, -1]
+      }
+    }
+  ]
+}
+```
+
+### 3. Excel (.xlsx)
+Workbooks should contain a `cycle_index` column. All other columns are treated as time-series telemetry.
+
+## ⚙️ Configuration (`config.yaml`)
+
+Manage paths and model thresholds without touching code:
+
+```yaml
+paths:
+  raw_data: "mat_files"
+  artifacts: "artifacts"
+models:
+  soh_threshold: 0.70
+  nominal_capacity_ah: 2.0
+```
+
+## 🐳 Docker Deployment
+
+To run the platform in a containerized environment:
+
+```bash
+docker build -t battery-shadow .
+docker run -p 8501:8501 battery-shadow
+```
+
+## 🧪 Testing
+
+Run the test suite using `pytest`:
+
+```bash
+export PYTHONPATH=$PYTHONPATH:.
+pytest tests/
+```
 
 ## 📖 Documentation
 For a detailed mathematical and architectural breakdown, see the [Technical Report](report.md).

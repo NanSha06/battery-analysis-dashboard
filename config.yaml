@@ -1,0 +1,21 @@
+# Li-ion Battery Digital Shadow Configuration
+
+paths:
+  raw_data: "mat_files"
+  artifacts: "artifacts"
+  cache: "artifacts/cache"
+  logs: "logs"
+
+models:
+  soh_threshold: 0.70
+  capacity_threshold_ah: 1.4
+  nominal_capacity_ah: 2.0
+  
+processing:
+  coulomb_alpha: 0.85
+  sampling_limit: 5000
+  uncertainty_n_samples: 500
+
+dashboard:
+  theme: "dark"
+  default_battery: "B0005"

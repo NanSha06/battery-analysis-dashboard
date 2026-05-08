@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
+import yaml
 from src.pipeline import build_and_export_dashboard_artifacts
 
 
@@ -67,12 +68,26 @@ def write_run_metadata(config: dict, metrics: dict, artifact_dir: Path):
 
 
 def main() -> None:
+    # Load config
+    config_path = ROOT / "config.yaml"
+    config_data = {}
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            config_data = yaml.safe_load(f)
+            
     args = parse_args()
+    
+    # Merge CLI args with config
+    mat_dir = Path(config_data.get("paths", {}).get("raw_data", args.mat_dir))
+    output_dir = Path(config_data.get("paths", {}).get("artifacts", args.output_dir))
+    nominal_cap = float(config_data.get("models", {}).get("nominal_capacity_ah", args.nominal_capacity_ah))
+    soh_thresh = float(config_data.get("models", {}).get("soh_threshold", args.soh_threshold))
+    
     paths = build_and_export_dashboard_artifacts(
-        mat_dir=Path(args.mat_dir),
-        output_dir=Path(args.output_dir),
-        nominal_capacity_ah=args.nominal_capacity_ah,
-        soh_threshold=args.soh_threshold,
+        mat_dir=mat_dir,
+        output_dir=output_dir,
+        nominal_capacity_ah=nominal_cap,
+        soh_threshold=soh_thresh,
         ecm_sample_limit=args.ecm_sample_limit,
     )
     

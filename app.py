@@ -735,7 +735,15 @@ def render_kpi_cards(
 def main() -> None:
     st.title("Li-ion Battery Digital Shadow")
 
-    default_artifact_dir = str(ROOT / "artifacts")
+    # Load config
+    config_path = ROOT / "config.yaml"
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+    else:
+        config = {"paths": {"artifacts": "artifacts"}, "models": {"soh_threshold": 0.70}}
+
+    default_artifact_dir = str(ROOT / config["paths"].get("artifacts", "artifacts"))
     artifact_dir = st.sidebar.text_input("Artifact directory", value=default_artifact_dir)
 
     try:
@@ -925,7 +933,7 @@ def main() -> None:
                 y="mae_v",
                 color="metric",
                 barmode="group",
-                title="Voltage Reconstruction Error",
+                title="Voltage Accuracy",
                 labels={"battery_id": "Battery", "mae_v": "MAE (V)", "metric": "Metric"},
             )
             error_compare_fig.update_layout(height=380)
@@ -990,7 +998,7 @@ def main() -> None:
                 line=dict(color="#60a5fa", width=2, dash='dash')
             ))
             
-        fig.update_layout(title=f"SOH Degradation & Bayesian Uncertainty: {selected_battery}",
+        fig.update_layout(title=f"Health Confidence: {selected_battery}",
                           xaxis_title="Cycle Index", yaxis_title="SOH", height=500)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -1026,7 +1034,7 @@ def main() -> None:
                 line=dict(color="#2dd4bf", width=2, dash='dot')
             ))
             
-        fig.update_layout(title=f"RUL Projection & GPR Uncertainty: {selected_battery}",
+        fig.update_layout(title=f"Life Prediction: {selected_battery}",
                           xaxis_title="Cycle Index", yaxis_title="Remaining Cycles", height=500)
         st.plotly_chart(fig, use_container_width=True)
         
@@ -1049,7 +1057,7 @@ def main() -> None:
             whatif_fig = go.Figure()
             whatif_fig.add_trace(go.Scatter(x=batt_rul["cycle_index"], y=batt_rul["rul_cycles"], name="Baseline RUL", line=dict(color="#666")))
             whatif_fig.add_trace(go.Scatter(x=sim_df["cycle_index"], y=sim_df["rul_cycles"], name="Simulated RUL", line=dict(color="#f85149", width=3)))
-            whatif_fig.update_layout(title="Stress Scenario Impact on RUL", xaxis_title="Cycle", yaxis_title="RUL (cycles)", height=400)
+            whatif_fig.update_layout(title="Stress Impact", xaxis_title="Cycle", yaxis_title="RUL (cycles)", height=400)
             st.plotly_chart(whatif_fig, use_container_width=True)
 
     with ocv_tab:
@@ -1076,7 +1084,7 @@ def main() -> None:
                 detail_shadow,
                 x="time_s",
                 y=["soc", "soc_ekf"],
-                title=f"SOC vs EKF SOC: {selected_battery}",
+                title="SOC Tracking",
             )
             st.plotly_chart(soc_fig, use_container_width=True)
 
@@ -1088,7 +1096,7 @@ def main() -> None:
                 detail_shadow,
                 x="time_s",
                 y=["current_a", "temperature_c"],
-                title=f"Current and Temperature: {selected_battery}",
+                title="Operating Conditions",
             )
             st.plotly_chart(thermo_fig, use_container_width=True)
 

@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import json
+import yaml
 import numpy as np
 import pandas as pd
 import pandera as pa
@@ -100,9 +102,26 @@ def _iter_cycles(root_struct: Any) -> list[Any]:
     return [cycle_value]
 
 
-def load_battery_cycles(mat_path: str | Path) -> BatteryDataset:
-    mat_path = Path(mat_path)
-    battery_id = mat_path.stem
+def load_battery_cycles(file_path: str | Path) -> BatteryDataset:
+    file_path = Path(file_path)
+    battery_id = file_path.stem
+    ext = file_path.suffix.lower()
+
+    try:
+        if ext == ".mat":
+            return _load_mat_battery(file_path, battery_id)
+        elif ext == ".json":
+            return _load_json_battery(file_path, battery_id)
+        elif ext == ".xlsx":
+            return _load_excel_battery(file_path, battery_id)
+        else:
+            raise ValueError(f"Unsupported file format: {ext}")
+    except Exception as e:
+        print(f"Error loading {file_path}: {e}")
+        return BatteryDataset(battery_id=battery_id, cycles=[])
+
+
+def _load_mat_battery(mat_path: Path, battery_id: str) -> BatteryDataset:
     mat_dict = loadmat(mat_path, squeeze_me=True, struct_as_record=False)
     root = _extract_mat_root(mat_dict, battery_id)
     cycles = []
@@ -136,16 +155,41 @@ def load_battery_cycles(mat_path: str | Path) -> BatteryDataset:
     return BatteryDataset(battery_id=battery_id, cycles=cycles)
 
 
-def load_all_batteries(mat_dir: str | Path) -> dict[str, BatteryDataset]:
-    mat_dir = Path(mat_dir)
+def _load_json_battery(path: Path, battery_id: str) -> BatteryDataset:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    # Expected format: {"battery_id": "...", "cycles": [...]}
+    return BatteryDataset(
+        battery_id=data.get("battery_id", battery_id),
+        cycles=data.get("cycles", [])
+    )
+
+
+def _load_excel_battery(path: Path, battery_id: str) -> BatteryDataset:
+    # Minimal Excel support: each sheet is a cycle or one sheet with cycle_index col
+    df = pd.read_excel(path)
+    cycles = []
+    if "cycle_index" in df.columns:
+        for idx, group in df.groupby("cycle_index"):
+            cycles.append({
+                "battery_id": battery_id,
+                "cycle_index": int(idx),
+                "cycle_type": group["cycle_type"].iloc[0] if "cycle_type" in group.columns else "unknown",
+                "data": {col: group[col].values for col in group.columns if col not in ["battery_id", "cycle_index", "cycle_type"]}
+            })
+    return BatteryDataset(battery_id=battery_id, cycles=cycles)
+
+
+def load_all_batteries(data_dir: str | Path) -> dict[str, BatteryDataset]:
+    data_dir = Path(data_dir)
     datasets: dict[str, BatteryDataset] = {}
-    for battery_id in REQUIRED_BATTERY_IDS:
-        path = mat_dir / f"{battery_id}.mat"
-        if path.exists():
-            datasets[battery_id] = load_battery_cycles(path)
-    if not datasets:
-        for path in sorted(mat_dir.glob("*.mat")):
+    
+    # Try different extensions
+    for ext in [".mat", ".json", ".xlsx"]:
+        for path in sorted(data_dir.glob(f"*{ext}")):
+            if path.stem in datasets: continue
             datasets[path.stem] = load_battery_cycles(path)
+            
     return datasets
 
 
