@@ -158,8 +158,12 @@ def estimate_soh_regression(cycle_table: pd.DataFrame) -> tuple[pd.DataFrame, Ba
     feature_cols = [c for c in feature_cols if c in discharge.columns]
     
     usable = discharge.dropna(subset=["soh"] + feature_cols).copy()
+    frame["soh_model"] = np.nan
+    frame["soh_model_pred"] = np.nan
+    frame["soh_model_lower"] = np.nan
+    frame["soh_model_upper"] = np.nan
+    
     if len(usable) < 5:
-        frame["soh_model"] = np.nan
         return frame, None
 
     X = usable[feature_cols]

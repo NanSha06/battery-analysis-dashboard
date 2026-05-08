@@ -195,6 +195,7 @@ def add_rul_estimates(
     frame = cycle_table.copy()
     frame["estimated_eol_cycle"] = np.nan
     frame["rul_cycles"] = np.nan
+    frame["rul_cycles_gpr"] = np.nan
     frame["rul_p10"] = np.nan
     frame["rul_p90"] = np.nan
 

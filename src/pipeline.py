@@ -86,7 +86,13 @@ def build_digital_shadow(
                 "discharge_number",
                 "soh",
                 "soh_model",
+                "soh_model_pred",
+                "soh_model_upper",
+                "soh_model_lower",
                 "rul_cycles",
+                "rul_cycles_gpr",
+                "rul_p10",
+                "rul_p90",
             ]
         ],
         on=["battery_id", "cycle_index"],
@@ -243,7 +249,21 @@ def build_and_export_dashboard_artifacts(
                 nominal_capacity_ah=nominal_capacity_ah,
             )
             sample_shadow_battery = sample_shadow_battery.merge(
-                cycle_shadow[["battery_id", "cycle_index", "soh", "soh_model", "rul_cycles"]],
+                cycle_shadow[
+                    [
+                        "battery_id",
+                        "cycle_index",
+                        "soh",
+                        "soh_model",
+                        "soh_model_pred",
+                        "soh_model_upper",
+                        "soh_model_lower",
+                        "rul_cycles",
+                        "rul_cycles_gpr",
+                        "rul_p10",
+                        "rul_p90",
+                    ]
+                ],
                 on=["battery_id", "cycle_index"],
                 how="left",
             )
