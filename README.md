@@ -1,4 +1,4 @@
-# Li-ion Battery Digital Shadow Platform (V2)
+# Li-ion Battery Digital Shadow Platform (V3)
 
 A data-driven digital twin and diagnostic platform for Li-ion batteries, featuring advanced state estimation, probabilistic health forecasting, and multivariate anomaly detection.
 
@@ -8,20 +8,22 @@ A data-driven digital twin and diagnostic platform for Li-ion batteries, featuri
 
 ## 🌟 Key Features
 
-### 🔍 Advanced State Estimation
-- **Sage-Husa Adaptive EKF:** Real-time SOC tracking with dynamic covariance adjustment for varying noise environments.
-- **2-RC Equivalent Circuit Modeling:** High-fidelity voltage reconstruction with state-dependent parameter modulation.
-- **OCV-SOC Anchor Correction:** Automated drift correction using electrochemical rest-period anchors.
+### 🔍 Autonomous Physics-Based Diagnostics
+- **State of Power (SOP):** Real-time peak power forecasting using state-dependent resistance.
+- **Lithium Plating Index:** Risk-based safety monitoring for high-rate/low-temp charging.
+- **Knee-point Detection:** Automated identification of accelerated aging phases (Kneedle algorithm).
+- **Sage-Husa Adaptive EKF:** High-fidelity SOC tracking with dynamic noise adaptation.
 
-### 📈 Probabilistic Health & RUL
-- **Bayesian SOH Fusion:** Multi-signal health estimation (Capacity + Resistance) with **90% Confidence Intervals**.
-- **Gaussian Process Regression (GPR):** Non-linear Remaining Useful Life (RUL) projections with probabilistic uncertainty bands.
-- **Pooled Degradation Modeling:** Cross-battery fleet analysis using Leave-One-Group-Out (LOGO) cross-validation.
+### 📈 Reliability & Risk Forecasting
+- **Monte Carlo GPR Simulation:** Probabilistic RUL trajectories with p5 through p95 confidence bands.
+- **Arrhenius Capacity Fade:** Semi-empirical thermal degradation modeling for long-term health.
+- **SOH Calibration Analytics:** Automated coverage checks and reliability diagrams for model validation.
 
-### 🛡️ Diagnostic Intelligence
-- **Multivariate Anomaly Detection:** Isolation Forest model identifying complex degradation signatures across health and thermal domains.
-- **Transient Impedance Validation:** Real-time R0 validation against physical voltage-pulse responses.
-- **Schema Enforcement:** Strict data quality control using **Pandera** validation during ingestion.
+### 🛡️ Operational Intelligence
+- **Maintenance Decision Engine:** Rule-based protocol recommendations (Normal, Reduce C-rate, Replace).
+- **What-if Scenario Simulator:** Interactive stress testing for temperature and C-rate impacts on RUL.
+- **Operating Regime Clustering:** KMeans analysis of usage patterns to identify high-degradation behaviors.
+- **Safety Audit CLI:** Rapid fleet-wide risk screening for plating and power fade.
 
 ## 🚀 Quick Start
 
@@ -41,7 +43,9 @@ python scripts/prepare_dashboard_data.py --mat-dir mat_files --output-dir artifa
 streamlit run app.py
 ```
 
-## 🛠️ Infrastructure (V2 Upgrades)
+## 🛠️ Infrastructure (V3 Upgrades)
+- **Fleet Safety Audit CLI:** `python scripts/safety_audit.py` for automated risk reporting.
+- **Physics-Informed Unit Tests:** Automated validation of SOP and Arrhenius logic via `pytest`.
 - **Cycle-Level Caching:** Parquet-based caching reduces incremental run times by >80%.
 - **Experiment Tracking:** Automated run metadata and configuration hashing for reproducibility.
 - **Cross-Platform Robustness:** Full UTF-8 support and environment configuration for Windows stability.

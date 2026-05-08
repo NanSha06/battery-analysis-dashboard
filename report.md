@@ -21,6 +21,7 @@
 5. [Module Reference](#5-module-reference)
 6. [Dashboard Visualization](#6-dashboard-visualization)
 7. [Data-Driven Improvements (V2 Upgrade)](#7-data-driven-improvements-v2-upgrade)
+8. [Autonomy & Physics (V3 Upgrade)](#8-autonomy--physics-v3-upgrade)
 
 ---
 
@@ -36,6 +37,8 @@ The system combines:
 - **Extended Kalman Filtering** for real-time state correction
 - **Transient impedance analysis** for ECM validation
 - **EIS-based scale alignment** for physical unit consistency
+- **State of Power (SOP)** and **Lithium Plating Risk** for safety diagnostics
+- **Monte Carlo RUL** and **Knee-point detection** for predictive autonomy
 
 ---
 
@@ -47,13 +50,11 @@ The system combines:
 | Data Format | NASA `.mat` files | Raw battery telemetry |
 | Data I/O | `scipy.io.loadmat` | MAT file parsing |
 | DataFrames | `pandas`, `numpy` | Tabular data processing |
-| Optimization | `scipy.optimize.least_squares` | ECM parameter fitting |
-| Statistics | `scipy.stats.pearsonr` | Correlation analysis |
-| ML | `scikit-learn` (Ridge regression) | SOH regression model |
-| Visualization | `plotly` (dark theme) | Interactive charts |
-| Dashboard | `Streamlit` | Web-based UI |
+| Optimization | `scipy.optimize.curve_fit` | Arrhenius model fitting |
+| Autonomy | `kneed` | Knee-point detection |
 | Serialization | `parquet`, `json` | Artifact storage |
 | Validation | `pandera` | Data schema enforcement |
+| Testing | `pytest` | Infrastructure reliability |
 
 **File structure:**
 ```
@@ -64,10 +65,14 @@ src/
 ├── rul.py                  # RUL estimation & EOL prediction
 ├── ecm.py                  # 2-RC ECM, EKF, OCV curve
 ├── impedance_validation.py # Transient impedance & R0 validation
+├── recommendations.py      # Charge protocol & maintenance engine
+├── calibration.py          # Model reliability & coverage checks
 ├── pipeline.py             # Orchestration & artifact export
 ├── dashboard_data.py       # Dashboard data loading utilities
 app.py                      # Streamlit dashboard
 scripts/prepare_dashboard_data.py  # CLI entry point
+scripts/safety_audit.py     # Fleet-level risk screening
+tests/test_physics.py       # Physics-informed model tests
 ```
 
 ---
@@ -497,6 +502,83 @@ This identifies complex degradation patterns that univariate checks might miss.
 
 ---
 
+### 4.13 State of Power (SOP)
+
+**Source:** `src/pipeline.py`
+
+SOP estimates the peak deliverable power at any given state:
+
+$$\text{SOP} = \frac{V_{\text{min}} \cdot (V_{\text{OCV}}(\text{SOC}) - V_{\text{min}})}{R_0 + R_1 + R_2}$$
+
+Where $V_{\text{min}} = 3.0$ V is the safe lower voltage limit. This provides a dynamic power constraint for operational safety.
+
+---
+
+### 4.14 Lithium Plating Risk
+
+**Source:** `src/pipeline.py`
+
+Identifies conditions conducive to metallic lithium deposition on the anode:
+
+$$\text{Risk} = \text{clip}\left( \frac{I_{\text{charge}} / Q_{\text{nom}}}{\max(T, 1.0)} \cdot (1 - \text{SOC}), 0, 1 \right)$$
+
+Higher risks are flagged during high-rate charging at low temperatures and high SOC.
+
+---
+
+### 4.15 Knee-Point Detection
+
+**Source:** `src/rul.py`
+
+Identifies the transition from stable aging to rapid degradation (knee-point) using the **Kneedle** algorithm:
+
+- **Input:** SOH vs. Cycle Index.
+- **Output:** `knee_cycle` and `post_knee_degradation_rate`.
+
+If the battery is past its knee, the RUL extrapolation switches to the steeper post-knee slope for conservative estimation.
+
+---
+
+### 4.16 Arrhenius Capacity Fade
+
+**Source:** `src/rul.py`
+
+A semi-empirical model for temperature-dependent aging:
+
+$$Q_{\text{loss}} = A \cdot \exp\left( -\frac{E_a}{R T} \right) \cdot n^{0.5}$$
+
+Where:
+- $Q_{\text{loss}} = 1 - \text{SOH}$
+- $A, E_a$ are fitted coefficients.
+- $R = 8.314$ J/(mol·K)
+- $n$ is the cycle index.
+
+---
+
+### 4.17 Operating Regime Clustering
+
+**Source:** `src/features.py`
+
+Cycles are grouped into regimes using **KMeans (k=3)** based on:
+- Mean Temperature
+- Mean Current
+- Cycle Duration
+- Depth of Discharge (DoD)
+
+This allows the platform to identify which specific usage patterns (e.g., "High Heat / High C-rate") are driving faster degradation.
+
+---
+
+### 4.18 Monte Carlo RUL Simulation
+
+**Source:** `src/rul.py`
+
+Instead of a single point estimate, RUL is simulated by drawing $N=500$ trajectories from the GPR posterior:
+- **Metrics:** p5, p25, p75, p95 RUL percentiles.
+- **Purpose:** Provides a comprehensive risk profile for long-term mission planning.
+
+---
+
 ## 5. Module Reference
 
 | Module | Key Functions | Output |
@@ -518,12 +600,12 @@ The Streamlit dashboard is organized into **6 tabs**:
 
 | Tab | Contents |
 |-----|----------|
-| **Overview** | AI insight summary, multi-battery comparison (SOH, RUL bars), EOL prediction plot |
-| **Battery Health** | SOH degradation curves, RUL projection across all batteries |
-| **ECM & Impedance** | R0 validation, transient impedance growth, EIS vs Model R0, scaling diagnostics, ECM parameter evolution |
-| **Electrochemical Insights** | OCV curve, voltage reconstruction (measured vs ECM vs EKF), SOC traces, thermal profiles, dynamic resistance/capacitance, coulombic efficiency |
-| **Diagnostics** | Cycle-level voltage/SOC/thermal plots, residual analysis, ECM metrics JSON |
-| **Data Explorer** | Raw sample data table, cycle-level ECM table, CSV download |
+| **Overview** | Maintenance Decision Panel, AI insight summary, multi-battery comparison, EOL prediction |
+| **Battery Health** | SOH curves, RUL projection, **What-if Scenario Simulator** |
+| **ECM & Impedance** | R0 validation, impedance growth, EIS vs Model R0, parameter evolution |
+| **Electrochemical Insights** | OCV curve, voltage reconstruction, SOC traces, thermal profiles, CE Trend |
+| **Diagnostics** | Operating Regime Clusters, SOH Calibration Reliability, anomaly scores, residual analysis |
+| **Data Explorer** | Raw sample table, cycle-level ECM table, CSV download |
 
 **Design system:** Dark charcoal theme (`#0e1117`), glassmorphism KPI cards with hover animations, `plotly_dark` chart template, responsive grid layouts.
 
@@ -544,6 +626,25 @@ Every pipeline run generates a unique `run_id` based on the configuration hash. 
 ### 7.3 Advanced Health Insights
 - **Confidence Bands:** Both SOH and RUL charts now include shaded regions representing model uncertainty (Bayesian and GPR respectively).
 - **Stress-Fitted Coefficients:** RUL stress corrections are now fitted to actual historical EOL data across the fleet rather than using heuristic constants.
+
+---
+
+## 8. Autonomy & Physics (V3 Upgrade)
+
+The V3 upgrade represents the shift from passive monitoring to **Autonomous Decision Support**:
+
+### 8.1 Maintenance Decision Panel
+Integrates a rule-based engine that evaluates health, power, and safety risks to recommend:
+- **NORMAL**: Safe operating envelope.
+- **REDUCE C-RATE**: High lithium plating risk detected.
+- **INSPECT**: Near-EOL or high anomalous variance.
+- **REPLACE**: Critical SOH or power fade.
+
+### 8.2 What-if Simulation
+Allows operators to visualize the impact of future stress (Temperature/C-rate) on the RUL projection, facilitating "optimal operation" discovery.
+
+### 8.3 Fleet Safety Audit CLI
+The `scripts/safety_audit.py` utility allows for rapid screening of the entire battery fleet, identifying critical assets that have exceeded risk thresholds for plating or power delivery.
 
 ---
 
