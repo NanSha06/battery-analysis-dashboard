@@ -16,17 +16,17 @@
     "outlier_counts": 0
   },
   "B0007": {
-    "mean_predicted_r0": 1.4849190772606237e-05,
+    "mean_predicted_r0": 1.48551736113118e-05,
     "mean_eis_r0": 0.05280664574008878,
-    "scale_factor": 3556.1968694958377,
+    "scale_factor": 3554.7646309483716,
     "normalization_detected": true,
     "unit_consistency": "Ohms (aligned)",
     "outlier_counts": 0
   },
   "B0018": {
-    "mean_predicted_r0": 1.551546215425589e-05,
+    "mean_predicted_r0": 1.5513182727861222e-05,
     "mean_eis_r0": 0.06297577669058985,
-    "scale_factor": 4058.9043410038284,
+    "scale_factor": 4059.5007352996104,
     "normalization_detected": true,
     "unit_consistency": "Ohms (aligned)",
     "outlier_counts": 0

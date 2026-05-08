@@ -11,6 +11,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 pio.templates.default = "plotly_dark"
 import streamlit as st
+import yaml
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:

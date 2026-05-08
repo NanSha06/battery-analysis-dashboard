@@ -430,6 +430,12 @@ def build_and_export_dashboard_artifacts(
                             scale_factor = 1.0
                             
                         cycle_shadow.loc[battery_mask, "r0_aligned"] = cycle_shadow.loc[battery_mask, "r0"] * scale_factor
+                        # Calculate total aligned resistance for better pulse validation
+                        cycle_shadow.loc[battery_mask, "r_total_aligned"] = (
+                            cycle_shadow.loc[battery_mask, "r0"] + 
+                            cycle_shadow.loc[battery_mask, "r1"] + 
+                            cycle_shadow.loc[battery_mask, "r2"]
+                        ) * scale_factor
                         
                         scaling_metrics[battery_id] = {
                             "mean_predicted_r0": r0_pred_mean,
@@ -447,9 +453,10 @@ def build_and_export_dashboard_artifacts(
                 else:
                     cycle_shadow.loc[battery_mask, "r0_aligned"] = cycle_shadow.loc[battery_mask, "r0"]
 
-                val_frame = cycle_shadow.loc[battery_mask].dropna(subset=["r0_aligned", "estimated_impedance_ohm"])
+                val_frame = cycle_shadow.loc[battery_mask].dropna(subset=["r_total_aligned", "estimated_impedance_ohm"])
                 if not val_frame.empty:
-                    val = validate_r0(val_frame["r0_aligned"], val_frame["estimated_impedance_ohm"])
+                    # Compare Total Model Resistance to Total Pulse Impedance
+                    val = validate_r0(val_frame["r_total_aligned"], val_frame["estimated_impedance_ohm"])
                     r0_validation[battery_id] = val
                     
                     trend = analyze_impedance_growth(val_frame["cycle_index"], val_frame["estimated_impedance_ohm"])
