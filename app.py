@@ -837,6 +837,22 @@ def main() -> None:
     physics_tab = electro_tab
 
     with comparison_tab:
+        # --- Group 6 Fleet Safety Audit ---
+        with st.expander("🛡️ Fleet Safety Audit (Fleet-wide Risk Scan)", expanded=True):
+            high_plating = cycle_shadow[cycle_shadow["plating_risk"] > 0.5]["battery_id"].unique()
+            low_sop = cycle_shadow[cycle_shadow["sop_w"] < 5.0]["battery_id"].unique()
+            critical = set(high_plating) | set(low_sop)
+            
+            if not critical:
+                st.success("✅ All batteries in the fleet are operating within safe bounds.")
+            else:
+                st.error(f"⚠️ {len(critical)} batteries require immediate attention.")
+                for bid in critical:
+                    risks = []
+                    if bid in high_plating: risks.append("High Plating Risk")
+                    if bid in low_sop: risks.append("Low SOP (Power Fade)")
+                    st.markdown(f"- **{bid}**: {', '.join(risks)}")
+
         st.markdown("### AI Insight Summary")
         if np.isfinite(summary["latest_soh"]):
             soh_percent = summary["latest_soh"] * 100
@@ -1129,6 +1145,27 @@ def main() -> None:
                 efficiency_fig.update_layout(height=400, hovermode="x unified")
                 st.plotly_chart(efficiency_fig, use_container_width=True)
                 st.dataframe(efficiency_table, use_container_width=True)
+
+            st.markdown("#### Operational Safety & Power Limits")
+            safety_grid = st.columns(2)
+            with safety_grid[0]:
+                if "sop_w" in detail_cycle_shadow.columns:
+                    sop_fig = px.line(
+                        detail_cycle_shadow.dropna(subset=["sop_w"]), 
+                        x="cycle_index", y="sop_w", 
+                        title="State of Power (SOP) Evolution",
+                        labels={"cycle_index": "Cycle", "sop_w": "Peak Power (W)"}
+                    )
+                    st.plotly_chart(sop_fig, use_container_width=True)
+            with safety_grid[1]:
+                if "plating_risk" in detail_cycle_shadow.columns:
+                    risk_fig = px.line(
+                        detail_cycle_shadow.dropna(subset=["plating_risk"]), 
+                        x="cycle_index", y="plating_risk", 
+                        title="Lithium Plating Risk Index",
+                        labels={"cycle_index": "Cycle", "plating_risk": "Risk Score (0-1)"}
+                    )
+                    st.plotly_chart(risk_fig, use_container_width=True)
 
             st.markdown("#### Physics Feature Summary")
             st.dataframe(build_physics_summary(physics_shadow), use_container_width=True)
