@@ -577,6 +577,288 @@ def build_residual_plot(detail_shadow: pd.DataFrame, selected_battery: str):
     return fig
 
 
+def _regression_metrics(actual: pd.Series, predicted: pd.Series) -> dict[str, float]:
+    frame = pd.DataFrame({"actual": actual, "predicted": predicted}).dropna()
+    if frame.empty:
+        return {
+            "rmse": np.nan,
+            "mae": np.nan,
+            "max_error": np.nan,
+            "residual_mean": np.nan,
+            "correlation": np.nan,
+            "r2": np.nan,
+            "drift_percent": np.nan,
+        }
+
+    residual = frame["predicted"] - frame["actual"]
+    ss_res = float(np.sum(residual**2))
+    ss_tot = float(np.sum((frame["actual"] - frame["actual"].mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    correlation = (
+        float(np.corrcoef(frame["actual"], frame["predicted"])[0, 1])
+        if len(frame) > 1 and frame["actual"].std() > 0 and frame["predicted"].std() > 0
+        else np.nan
+    )
+    baseline = float(np.nanmean(np.abs(frame["actual"])))
+    drift = float((residual.iloc[-1] - residual.iloc[0]) / baseline * 100.0) if baseline > 0 else np.nan
+    return {
+        "rmse": float(np.sqrt(np.mean(residual**2))),
+        "mae": float(np.mean(np.abs(residual))),
+        "max_error": float(np.max(np.abs(residual))),
+        "residual_mean": float(np.mean(residual)),
+        "correlation": correlation,
+        "r2": r2,
+        "drift_percent": drift,
+    }
+
+
+def compute_validation_metrics(detail_shadow: pd.DataFrame) -> dict[str, dict[str, float]]:
+    voltage = (
+        _regression_metrics(detail_shadow["voltage_v"], detail_shadow["voltage_model_v"])
+        if {"voltage_v", "voltage_model_v"}.issubset(detail_shadow.columns)
+        else {}
+    )
+    soc = (
+        _regression_metrics(detail_shadow["soc"], detail_shadow["soc_ekf"])
+        if {"soc", "soc_ekf"}.issubset(detail_shadow.columns)
+        else {}
+    )
+    return {"voltage": voltage, "soc": soc}
+
+
+def validation_quality(metrics: dict[str, float]) -> tuple[str, str, str]:
+    rmse = metrics.get("rmse", np.nan)
+    r2 = metrics.get("r2", np.nan)
+    drift = abs(metrics.get("drift_percent", np.nan))
+    if np.isfinite(rmse) and np.isfinite(r2) and rmse <= 0.03 and r2 >= 0.95 and (not np.isfinite(drift) or drift <= 1.0):
+        return "Excellent", "#3fb950", "low residual spread, strong fit, and stable drift."
+    if np.isfinite(rmse) and np.isfinite(r2) and rmse <= 0.08 and r2 >= 0.85:
+        return "Good", "#d29922", "usable agreement with measurable residual structure."
+    return "Weak", "#f85149", "validation needs review because residual error, drift, or fit quality is outside target bands."
+
+
+def render_validation_summary(metrics: dict[str, float], title: str, units: str = "") -> None:
+    quality, color, reason = validation_quality(metrics)
+    suffix = f" {units}" if units else ""
+    st.markdown(f"#### {title}")
+    cols = st.columns(6)
+    cols[0].metric("RMSE", format_kpi_value(metrics.get("rmse"), suffix=suffix, digits=4))
+    cols[1].metric("MAE", format_kpi_value(metrics.get("mae"), suffix=suffix, digits=4))
+    cols[2].metric("Max Error", format_kpi_value(metrics.get("max_error"), suffix=suffix, digits=4))
+    cols[3].metric("Correlation", format_kpi_value(metrics.get("correlation"), digits=3))
+    cols[4].metric("R²", format_kpi_value(metrics.get("r2"), digits=3))
+    cols[5].metric("Drift", format_kpi_value(metrics.get("drift_percent"), suffix=" %", digits=2))
+    st.markdown(
+        f'''
+        <div style="background: rgba(30,34,42,0.4); border-left: 4px solid {color}; padding: 14px; border-radius: 8px; margin-bottom: 16px;">
+            <strong>{quality} validation:</strong> {reason}
+        </div>
+        ''',
+        unsafe_allow_html=True,
+    )
+
+
+def build_voltage_validation_plots(detail_shadow: pd.DataFrame) -> tuple[go.Figure, go.Figure, go.Figure]:
+    frame = detail_shadow.dropna(subset=["time_s", "voltage_error_v"]).copy()
+    residual_line = px.line(
+        frame,
+        x="time_s",
+        y="voltage_error_v",
+        color="cycle_type" if "cycle_type" in frame.columns else None,
+        title="ECM Voltage Residual vs Time",
+        labels={"time_s": "Time (s)", "voltage_error_v": "Residual (V)"},
+    )
+    residual_line.add_hline(y=0, line_dash="dash", line_color="#6b7280")
+    residual_hist = px.histogram(
+        frame,
+        x="voltage_error_v",
+        nbins=50,
+        title="ECM Voltage Residual Histogram",
+        labels={"voltage_error_v": "Residual (V)"},
+    )
+    residual_box = px.box(
+        frame,
+        y="voltage_error_v",
+        x="cycle_type" if "cycle_type" in frame.columns else None,
+        title="ECM Voltage Residual Boxplot",
+        labels={"voltage_error_v": "Residual (V)", "cycle_type": "Cycle Type"},
+    )
+    for fig in (residual_line, residual_hist, residual_box):
+        fig.update_layout(height=380)
+    return residual_line, residual_hist, residual_box
+
+
+def build_soc_residual_plot(detail_shadow: pd.DataFrame) -> go.Figure:
+    frame = detail_shadow.dropna(subset=["time_s", "soc", "soc_ekf"]).copy()
+    frame["soc_residual"] = frame["soc_ekf"] - frame["soc"]
+    fig = px.line(
+        frame,
+        x="time_s",
+        y="soc_residual",
+        color="cycle_type" if "cycle_type" in frame.columns else None,
+        title="SOC Residual vs Time",
+        labels={"time_s": "Time (s)", "soc_residual": "SOC EKF - SOC"},
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="#6b7280")
+    fig.update_layout(height=400, hovermode="x unified")
+    return fig
+
+
+def build_uncertainty_plots(detail_shadow: pd.DataFrame) -> tuple[go.Figure, go.Figure]:
+    frame = detail_shadow.sort_values(["cycle_index", "time_s"]).copy()
+    frame["voltage_sigma"] = frame["voltage_error_v"].rolling(window=80, min_periods=10).std().bfill().ffill()
+    fallback_sigma = frame["voltage_error_v"].std()
+    frame["voltage_sigma"] = frame["voltage_sigma"].fillna(fallback_sigma if np.isfinite(fallback_sigma) else 0.0)
+    frame["voltage_lower"] = frame["voltage_model_v"] - 1.96 * frame["voltage_sigma"]
+    frame["voltage_upper"] = frame["voltage_model_v"] + 1.96 * frame["voltage_sigma"]
+
+    voltage_fig = go.Figure()
+    voltage_fig.add_trace(go.Scatter(x=frame["time_s"], y=frame["voltage_upper"], mode="lines", line=dict(width=0), showlegend=False))
+    voltage_fig.add_trace(go.Scatter(x=frame["time_s"], y=frame["voltage_lower"], mode="lines", fill="tonexty", fillcolor="rgba(88,166,255,0.18)", line=dict(width=0), name="95% band"))
+    voltage_fig.add_trace(go.Scatter(x=frame["time_s"], y=frame["voltage_v"], mode="lines", name="Measured Voltage", line=dict(color="#f0f6fc", width=1.5)))
+    voltage_fig.add_trace(go.Scatter(x=frame["time_s"], y=frame["voltage_model_v"], mode="lines", name="ECM Voltage", line=dict(color="#58a6ff", width=2)))
+    voltage_fig.update_layout(title="Prediction Uncertainty Band", xaxis_title="Time (s)", yaxis_title="Voltage (V)", height=420, hovermode="x unified")
+
+    soc_fig = go.Figure()
+    if "soc_ekf_std" in frame.columns:
+        frame["soc_lower"] = (frame["soc_ekf"] - 1.96 * frame["soc_ekf_std"]).clip(0.0, 1.0)
+        frame["soc_upper"] = (frame["soc_ekf"] + 1.96 * frame["soc_ekf_std"]).clip(0.0, 1.0)
+        soc_fig.add_trace(go.Scatter(x=frame["time_s"], y=frame["soc_upper"], mode="lines", line=dict(width=0), showlegend=False))
+        soc_fig.add_trace(go.Scatter(x=frame["time_s"], y=frame["soc_lower"], mode="lines", fill="tonexty", fillcolor="rgba(63,185,80,0.18)", line=dict(width=0), name="EKF 95% CI"))
+    soc_fig.add_trace(go.Scatter(x=frame["time_s"], y=frame["soc"], mode="lines", name="Raw SOC", line=dict(color="#f0f6fc", width=1.5)))
+    soc_fig.add_trace(go.Scatter(x=frame["time_s"], y=frame["soc_ekf"], mode="lines", name="EKF SOC", line=dict(color="#3fb950", width=2)))
+    soc_fig.update_layout(title="EKF Covariance / SOC Confidence Interval", xaxis_title="Time (s)", yaxis_title="SOC", height=420, hovermode="x unified")
+    return voltage_fig, soc_fig
+
+
+def build_time_constant_plot(cycle_frame: pd.DataFrame) -> go.Figure:
+    frame = cycle_frame.dropna(subset=["cycle_index", "r1", "c1", "r2", "c2"]).copy()
+    frame["tau1_s"] = frame["r1"] * frame["c1"]
+    frame["tau2_s"] = frame["r2"] * frame["c2"]
+    fig = px.line(
+        frame,
+        x="cycle_index",
+        y=["tau1_s", "tau2_s"],
+        markers=True,
+        title="ECM Time Constants",
+        labels={"cycle_index": "Cycle Index", "value": "Time Constant (s)", "variable": "Parameter"},
+    )
+    fig.update_layout(height=400, hovermode="x unified")
+    return fig
+
+
+def build_parameter_drift_plot(cycle_frame: pd.DataFrame) -> go.Figure:
+    frame = cycle_frame.dropna(subset=["cycle_index"]).copy()
+    parameter_cols = [col for col in ["r0", "r1", "r2", "c1", "c2"] if col in frame.columns]
+    for col in parameter_cols:
+        first = frame[col].dropna().iloc[0] if not frame[col].dropna().empty else np.nan
+        frame[f"{col}_drift_pct"] = (frame[col] - first) / abs(first) * 100.0 if np.isfinite(first) and first != 0 else np.nan
+    drift_cols = [f"{col}_drift_pct" for col in parameter_cols]
+    fig = px.line(
+        frame,
+        x="cycle_index",
+        y=drift_cols,
+        markers=True,
+        title="ECM Parameter Drift from First Selected Cycle",
+        labels={"cycle_index": "Cycle Index", "value": "Drift (%)", "variable": "Parameter"},
+    )
+    fig.update_layout(height=400, hovermode="x unified")
+    return fig
+
+
+def build_temperature_validation_plots(detail_shadow: pd.DataFrame, cycle_frame: pd.DataFrame) -> tuple[go.Figure, go.Figure]:
+    sample = detail_shadow.dropna(subset=["temperature_c", "voltage_error_v"]).copy()
+    if not sample.empty:
+        sample["temperature_bin_c"] = (sample["temperature_c"] / 2.0).round() * 2.0
+        temp_rmse = sample.groupby("temperature_bin_c", as_index=False)["voltage_error_v"].apply(
+            lambda s: float(np.sqrt(np.mean(np.square(s))))
+        )
+        temp_rmse = temp_rmse.rename(columns={"voltage_error_v": "rmse_v"})
+    else:
+        temp_rmse = pd.DataFrame(columns=["temperature_bin_c", "rmse_v"])
+    rmse_fig = px.line(
+        temp_rmse,
+        x="temperature_bin_c",
+        y="rmse_v",
+        markers=True,
+        title="Voltage RMSE vs Temperature",
+        labels={"temperature_bin_c": "Temperature (C)", "rmse_v": "RMSE (V)"},
+    )
+    rmse_fig.update_layout(height=380)
+
+    resistance_col = "r_total_aligned" if "r_total_aligned" in cycle_frame.columns else "total_resistance_ohm"
+    resistance_frame = cycle_frame.dropna(subset=["temperature_mean_c", resistance_col]).copy() if resistance_col in cycle_frame.columns else pd.DataFrame()
+    resistance_fig = px.scatter(
+        resistance_frame,
+        x="temperature_mean_c",
+        y=resistance_col,
+        color="cycle_index" if not resistance_frame.empty else None,
+        title="Resistance vs Temperature",
+        labels={"temperature_mean_c": "Temperature (C)", resistance_col: "Resistance (Ohm)"},
+    )
+    if len(resistance_frame) >= 3:
+        fit_frame = resistance_frame.dropna(subset=["temperature_mean_c", resistance_col]).sort_values("temperature_mean_c")
+        slope, intercept = np.polyfit(fit_frame["temperature_mean_c"], fit_frame[resistance_col], 1)
+        resistance_fig.add_trace(
+            go.Scatter(
+                x=fit_frame["temperature_mean_c"],
+                y=slope * fit_frame["temperature_mean_c"] + intercept,
+                mode="lines",
+                name="Linear fit",
+                line=dict(color="#f85149", dash="dash"),
+            )
+        )
+    resistance_fig.update_layout(height=380)
+    return rmse_fig, resistance_fig
+
+
+def ecm_impedance_response(params: dict[str, float], frequencies_hz: np.ndarray) -> np.ndarray:
+    r0 = float(params.get("r0", 0.01))
+    r1 = float(params.get("r1", 0.01))
+    c1 = float(params.get("c1", 2000.0))
+    r2 = float(params.get("r2", 0.02))
+    c2 = float(params.get("c2", 4000.0))
+    omega = 2.0 * np.pi * frequencies_hz
+    return r0 + r1 / (1.0 + 1j * omega * r1 * c1) + r2 / (1.0 + 1j * omega * r2 * c2)
+
+
+def build_impedance_validation(cycle_frame: pd.DataFrame, params: dict[str, float]) -> tuple[dict[str, float], go.Figure, go.Figure]:
+    frequencies = np.logspace(-3, 3, 160)
+    z_model = ecm_impedance_response(params, frequencies)
+    eis_frame = cycle_frame.dropna(subset=["re_ohm", "rct_ohm"]).copy() if {"re_ohm", "rct_ohm"}.issubset(cycle_frame.columns) else pd.DataFrame()
+
+    nyquist = go.Figure()
+    nyquist.add_trace(go.Scatter(x=np.real(z_model), y=-np.imag(z_model), mode="lines", name="ECM"))
+    if not eis_frame.empty:
+        nyquist.add_trace(go.Scatter(x=eis_frame["re_ohm"], y=np.zeros(len(eis_frame)), mode="markers", name="Experimental EIS Re"))
+        nyquist.add_trace(go.Scatter(x=eis_frame["re_ohm"] + eis_frame["rct_ohm"], y=eis_frame["rct_ohm"] / 2.0, mode="markers", name="Experimental EIS Arc"))
+    nyquist.update_layout(title="Nyquist: Experimental EIS vs ECM", xaxis_title="Z real (Ohm)", yaxis_title="-Z imag (Ohm)", height=430)
+
+    bode = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.10, subplot_titles=("Magnitude", "Phase"))
+    bode.add_trace(go.Scatter(x=frequencies, y=np.abs(z_model), mode="lines", name="ECM |Z|"), row=1, col=1)
+    bode.add_trace(go.Scatter(x=frequencies, y=np.angle(z_model, deg=True), mode="lines", name="ECM Phase"), row=2, col=1)
+    if not eis_frame.empty:
+        z_exp = eis_frame["re_ohm"] + eis_frame["rct_ohm"]
+        f_exp = np.geomspace(frequencies.min(), frequencies.max(), len(eis_frame))
+        bode.add_trace(go.Scatter(x=f_exp, y=z_exp, mode="markers", name="Experimental |Z|"), row=1, col=1)
+        bode.add_trace(go.Scatter(x=f_exp, y=np.zeros(len(eis_frame)), mode="markers", name="Experimental Phase"), row=2, col=1)
+    bode.update_xaxes(type="log", title_text="Frequency (Hz)", row=2, col=1)
+    bode.update_yaxes(title_text="|Z| (Ohm)", row=1, col=1)
+    bode.update_yaxes(title_text="Phase (deg)", row=2, col=1)
+    bode.update_layout(title="Bode: Magnitude and Phase", height=520, hovermode="x unified")
+
+    if eis_frame.empty:
+        metrics = {"impedance_rmse": np.nan, "phase_error_deg": np.nan}
+    else:
+        z_exp = (eis_frame["re_ohm"] + eis_frame["rct_ohm"]).to_numpy(dtype=float)
+        model_mag = np.interp(np.linspace(0, 1, len(z_exp)), np.linspace(0, 1, len(z_model)), np.abs(z_model))
+        metrics = {
+            "impedance_rmse": float(np.sqrt(np.mean((model_mag - z_exp) ** 2))),
+            "phase_error_deg": float(np.mean(np.abs(np.angle(z_model, deg=True)))),
+        }
+    return metrics, nyquist, bode
+
+
 def add_physics_features(
     detail_shadow: pd.DataFrame,
     ocv_curve: pd.DataFrame,
@@ -808,6 +1090,7 @@ def main() -> None:
     selected_ecm_params = battery_ecm_params.get(selected_battery, ecm_params)
     physics_shadow = add_physics_features(detail_shadow, ocv_curve, selected_ecm_params)
     efficiency_table = compute_efficiency_trends(compute_cycle_efficiency(detail_shadow))
+    validation_metrics = compute_validation_metrics(detail_shadow) if not detail_shadow.empty else {"voltage": {}, "soc": {}}
 
     render_maintenance_panel(summary, selected_battery, battery_cycle_shadow)
     render_kpi_cards(summary, latest_soc_value(detail_shadow), selected_battery, eol_summary)
@@ -1069,6 +1352,7 @@ def main() -> None:
         if detail_shadow.empty:
             st.info("No detail samples were found for the selected cycle range.")
         else:
+            render_validation_summary(validation_metrics["voltage"], "Voltage Validation", "V")
             voltage_fig = px.line(
                 detail_shadow,
                 x="time_s",
@@ -1076,11 +1360,19 @@ def main() -> None:
                 title=f"Measured vs ECM/EKF Voltage: {selected_battery}",
             )
             st.plotly_chart(voltage_fig, use_container_width=True)
+            residual_line, residual_hist, residual_box = build_voltage_validation_plots(detail_shadow)
+            st.plotly_chart(residual_line, use_container_width=True)
+            residual_cols = st.columns(2)
+            with residual_cols[0]:
+                st.plotly_chart(residual_hist, use_container_width=True)
+            with residual_cols[1]:
+                st.plotly_chart(residual_box, use_container_width=True)
 
     with soc_tab:
         if detail_shadow.empty:
             st.info("No detail samples were found for the selected cycle range.")
         else:
+            render_validation_summary(validation_metrics["soc"], "SOC Validation")
             soc_fig = px.line(
                 detail_shadow,
                 x="time_s",
@@ -1088,6 +1380,7 @@ def main() -> None:
                 title="SOC Tracking",
             )
             st.plotly_chart(soc_fig, use_container_width=True)
+            st.plotly_chart(build_soc_residual_plot(detail_shadow), use_container_width=True)
 
     with thermal_tab:
         if detail_shadow.empty:
@@ -1100,6 +1393,12 @@ def main() -> None:
                 title="Operating Conditions",
             )
             st.plotly_chart(thermo_fig, use_container_width=True)
+            temp_cols = st.columns(2)
+            temp_rmse_fig, resistance_temp_fig = build_temperature_validation_plots(detail_shadow, detail_cycle_shadow)
+            with temp_cols[0]:
+                st.plotly_chart(temp_rmse_fig, use_container_width=True)
+            with temp_cols[1]:
+                st.plotly_chart(resistance_temp_fig, use_container_width=True)
 
     with physics_tab:
         if physics_shadow.empty:
@@ -1138,6 +1437,13 @@ def main() -> None:
                 )
                 dynamic_capacitance_fig.update_layout(height=380, hovermode="x unified")
                 st.plotly_chart(dynamic_capacitance_fig, use_container_width=True)
+
+            st.markdown("#### Dynamic ECM Diagnostics")
+            diag_cols = st.columns(2)
+            with diag_cols[0]:
+                st.plotly_chart(build_time_constant_plot(detail_cycle_shadow), use_container_width=True)
+            with diag_cols[1]:
+                st.plotly_chart(build_parameter_drift_plot(detail_cycle_shadow), use_container_width=True)
 
             st.markdown("#### Coulombic Efficiency")
             if efficiency_table.empty:
@@ -1205,6 +1511,13 @@ def main() -> None:
         val_cols[2].metric("Correlation", format_kpi_value(r0_val.get("correlation"), digits=3))
         val_cols[3].metric("Drift", format_kpi_value(r0_val.get("drift_percent"), suffix=" %", digits=2))
         val_cols[4].metric("Res Growth", format_kpi_value(imp_met.get("growth_rate"), suffix=" Ω/cyc", digits=6))
+
+        imp_validation, nyquist_fig, bode_fig = build_impedance_validation(detail_cycle_shadow, selected_ecm_params)
+        imp_cols = st.columns(2)
+        imp_cols[0].metric("Impedance RMSE", format_kpi_value(imp_validation.get("impedance_rmse"), suffix=" Ω", digits=4))
+        imp_cols[1].metric("Phase Error", format_kpi_value(imp_validation.get("phase_error_deg"), suffix=" deg", digits=2))
+        st.plotly_chart(nyquist_fig, use_container_width=True)
+        st.plotly_chart(bode_fig, use_container_width=True)
         
         if not imp_trend_batt.empty:
             st.markdown("#### Resistance Growth Trend")
@@ -1344,8 +1657,15 @@ def main() -> None:
         if detail_shadow.empty:
             st.info("No detail samples were found for the selected cycle range.")
         else:
+            render_validation_summary(validation_metrics["voltage"], "Validation Summary Panel", "V")
             residual_fig = build_residual_plot(detail_shadow, selected_battery)
             st.plotly_chart(residual_fig, use_container_width=True)
+            uncertainty_voltage_fig, uncertainty_soc_fig = build_uncertainty_plots(detail_shadow)
+            uncertainty_cols = st.columns(2)
+            with uncertainty_cols[0]:
+                st.plotly_chart(uncertainty_voltage_fig, use_container_width=True)
+            with uncertainty_cols[1]:
+                st.plotly_chart(uncertainty_soc_fig, use_container_width=True)
 
     with parameters_tab:
         if detail_cycle_shadow.empty:
