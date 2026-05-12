@@ -5,7 +5,6 @@
     "ocv_curve": "artifacts\\ocv_curve.parquet",
     "impedance_trend": "artifacts\\impedance_trend.parquet",
     "impedance_curve": "artifacts\\impedance_curve.parquet",
-    "aligned_r0": "artifacts\\aligned_r0.parquet",
     "eis_reference": "artifacts\\eis_reference.parquet"
   },
   "sample_dir": "artifacts\\sample\\by_battery",
@@ -17,5 +16,6 @@
   "scaling_metrics_path": "artifacts\\scaling_metrics.json",
   "regime_stats_path": "artifacts\\regime_stats.json",
   "r0_validation_path": "artifacts\\r0_validation.json",
-  "impedance_metrics_path": "artifacts\\impedance_metrics.json"
+  "impedance_metrics_path": "artifacts\\impedance_metrics.json",
+  "ecm_consistency_path": "artifacts\\ecm_consistency.json"
 }

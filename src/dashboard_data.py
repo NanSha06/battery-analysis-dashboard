@@ -50,6 +50,17 @@ def load_battery_ecm_params(root_dir: str | Path) -> dict[str, dict[str, float]]
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def load_ecm_consistency(root_dir: str | Path) -> dict[str, Any]:
+    manifest = load_manifest(root_dir)
+    path_str = manifest.get("ecm_consistency_path")
+    if not path_str:
+        return {}
+    path = Path(path_str)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def available_battery_ids(root_dir: str | Path, table_kind: str = "sample_shadow") -> list[str]:
     manifest = load_manifest(root_dir)
     base_dir_key = "sample_shadow_dir" if table_kind == "sample_shadow" else "sample_dir"

@@ -165,26 +165,35 @@ def analyze_impedance_growth(cycles: np.ndarray | pd.Series, impedance: np.ndarr
 
 def smooth_impedance_series(
     impedance_values: np.ndarray | pd.Series,
-    window: int = 5,
+    window: int = 7,
 ) -> np.ndarray:
-    """Apply a rolling median + EMA filter to an impedance time-series.
+    """Apply robust outlier rejection, rolling median, and EMA smoothing.
 
-    This two-stage filter removes isolated spikes (median) then smooths
-    the residual oscillation (exponential moving average).
+    The output is the impedance signal used by adaptive scaling,
+    validation, R0 tracking, and Nyquist/Bode calibration.
     """
     arr = np.asarray(impedance_values, dtype=float)
     if len(arr) < 2:
         return arr
 
-    # Stage 1: rolling median (removes spikes)
     s = pd.Series(arr)
-    med = s.rolling(window=window, min_periods=1, center=True).median()
+    valid = s.replace([np.inf, -np.inf], np.nan)
+    global_med = valid.median()
+    global_mad = (valid - global_med).abs().median()
+    if pd.notna(global_mad) and global_mad > 1e-9:
+        valid = valid.mask((valid - global_med).abs() > 3.0 * global_mad)
+    valid = valid.interpolate(limit_direction="both").fillna(global_med)
 
-    # Stage 2: exponential moving average (smooths oscillation)
-    alpha = 2.0 / (window + 1)
+    med = valid.rolling(window=window, min_periods=1, center=True).median()
+    residual = (valid - med).abs()
+    local_mad = residual.rolling(window=window, min_periods=1, center=True).median()
+    stable = valid.mask(residual > (3.0 * local_mad.replace(0.0, np.nan))).interpolate(limit_direction="both").fillna(med)
+
+    alpha = 2.0 / (window + 2)
     ema = med.ewm(alpha=alpha, adjust=False).mean()
+    smooth = (0.35 * stable + 0.65 * ema).ewm(alpha=alpha, adjust=False).mean()
 
-    return ema.to_numpy(dtype=float)
+    return smooth.to_numpy(dtype=float)
 
 
 def process_battery_impedance(sample_table: pd.DataFrame) -> pd.DataFrame:
@@ -242,7 +251,7 @@ def process_battery_impedance(sample_table: pd.DataFrame) -> pd.DataFrame:
 
 
 ANOMALY_FEATURES = [
-    "estimated_impedance_ohm",  # transient impedance
+    "estimated_impedance_smoothed_ohm",  # robust transient impedance
     "soh",                      # state of health
     "temperature_mean_c",       # thermal stress
     "coulombic_efficiency",     # efficiency signal

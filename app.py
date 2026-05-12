@@ -22,13 +22,14 @@ from src.dashboard_data import (  # noqa: E402
     load_battery_table,
     load_battery_ecm_params,
     load_battery_metrics,
+    load_ecm_consistency,
     load_ecm_params,
     load_global_tables,
     load_manifest,
     load_metrics,
     summarize_battery,
 )
-from src.ecm import ECMParameters, get_dynamic_params, adaptive_r0  # noqa: E402
+from src.ecm import get_frequency_domain_params, validate_ecm_consistency  # noqa: E402
 from src.features import compute_cycle_efficiency, compute_efficiency_trends  # noqa: E402
 from src.state_estimators import apply_soc_anchor  # noqa: E402
 from src.recommendations import get_charge_recommendation # noqa: E402
@@ -167,6 +168,7 @@ def get_global_data(artifact_dir: str) -> dict:
                 data["impedance_metrics"] = json.load(f)
         else:
             data["impedance_metrics"] = {}
+        data["ecm_consistency"] = load_ecm_consistency(artifact_dir)
         if "scaling_metrics_path" in manifest and manifest["scaling_metrics_path"]:
             with open(manifest["scaling_metrics_path"], "r", encoding="utf-8") as f:
                 data["scaling_metrics"] = json.load(f)
@@ -189,6 +191,7 @@ def get_global_data(artifact_dir: str) -> dict:
     except Exception:
         data["r0_validation"] = {}
         data["impedance_metrics"] = {}
+        data["ecm_consistency"] = {}
         data["scaling_metrics"] = {}
         data["regime_stats"] = {}
         data["calibration"] = {}
@@ -786,8 +789,12 @@ def build_temperature_validation_plots(detail_shadow: pd.DataFrame, cycle_frame:
     )
     rmse_fig.update_layout(height=380)
 
-    resistance_col = "r_total_aligned" if "r_total_aligned" in cycle_frame.columns else "total_resistance_ohm"
-    resistance_frame = cycle_frame.dropna(subset=["temperature_mean_c", resistance_col]).copy() if resistance_col in cycle_frame.columns else pd.DataFrame()
+    resistance_frame = cycle_frame.dropna(subset=["temperature_mean_c", "r0", "r1", "r2"]).copy()
+    if not resistance_frame.empty:
+        resistance_frame["adaptive_total_resistance_ohm"] = (
+            resistance_frame["r0"] + resistance_frame["r1"] + resistance_frame["r2"]
+        )
+    resistance_col = "adaptive_total_resistance_ohm"
     resistance_fig = px.scatter(
         resistance_frame,
         x="temperature_mean_c",
@@ -812,15 +819,6 @@ def build_temperature_validation_plots(detail_shadow: pd.DataFrame, cycle_frame:
     return rmse_fig, resistance_fig
 
 
-ECM_PARAM_LIMITS = {
-    "r0": (1e-4, 1.0),
-    "r1": (1e-4, 1.0),
-    "r2": (1e-4, 1.0),
-    "c1": (1.0, 1e6),
-    "c2": (1.0, 1e6),
-}
-
-
 def _finite_median(frame: pd.DataFrame, column: str) -> float | None:
     if column not in frame.columns:
         return None
@@ -836,75 +834,6 @@ def _ema_smooth(values: np.ndarray, span: int = 5) -> np.ndarray:
     for i in range(1, len(values)):
         out[i] = alpha * values[i] + (1.0 - alpha) * out[i - 1]
     return out
-
-
-
-def get_adaptive_ecm_params(frame: pd.DataFrame) -> dict[str, float]:
-    """Extract adaptive ECM parameters cleanly from the dataframe medians."""
-    return {
-        "r0": _finite_median(frame, "r0") or 0.01,
-        "r1": _finite_median(frame, "r1") or 0.01,
-        "r2": _finite_median(frame, "r2") or 0.02,
-        "c1": _finite_median(frame, "c1") or 2000.0,
-        "c2": _finite_median(frame, "c2") or 4000.0,
-    }
-
-def sanitize_ecm_impedance_params(
-    params: dict[str, float],
-    cycle_frame: pd.DataFrame,
-) -> tuple[dict[str, float], list[str]]:
-    warnings: list[str] = []
-    clean: dict[str, float] = {}
-
-    for name, default in {"r0": 0.01, "r1": 0.01, "r2": 0.02, "c1": 2000.0, "c2": 4000.0}.items():
-        value = params.get(name, default)
-        clean[name] = float(value) if np.isfinite(value) else default
-
-    cycle_sources = {
-        "r0": ["r0_aligned", "r0"],
-        "r1": ["r1"],
-        "r2": ["r2"],
-        "c1": ["c1"],
-        "c2": ["c2"],
-    }
-    for name, columns in cycle_sources.items():
-        for column in columns:
-            median_value = _finite_median(cycle_frame, column)
-            if median_value is not None:
-                clean[name] = median_value
-                break
-
-    re_ref = _finite_median(cycle_frame, "re_ohm")
-    rct_ref = _finite_median(cycle_frame, "rct_ohm")
-    if re_ref is not None and re_ref > 0:
-        if clean["r0"] < 0.25 * re_ref or clean["r0"] > 4.0 * re_ref:
-            warnings.append("R0 was outside the EIS high-frequency intercept range and was aligned to measured Re(Z).")
-        clean["r0"] = re_ref if clean["r0"] < 0.25 * re_ref or clean["r0"] > 4.0 * re_ref else clean["r0"]
-
-    if rct_ref is not None and rct_ref > 0:
-        polarization = clean["r1"] + clean["r2"]
-        if polarization <= 0 or polarization < 0.25 * rct_ref or polarization > 4.0 * rct_ref:
-            ratio = clean["r1"] / polarization if polarization > 0 else 0.45
-            ratio = float(np.clip(ratio, 0.25, 0.75))
-            clean["r1"] = rct_ref * ratio
-            clean["r2"] = rct_ref * (1.0 - ratio)
-            warnings.append("R1 + R2 was aligned to measured charge-transfer resistance to avoid near-zero Bode magnitude.")
-
-    for name, (lower, upper) in ECM_PARAM_LIMITS.items():
-        before = clean[name]
-        clean[name] = float(np.clip(before, lower, upper))
-        if not np.isclose(before, clean[name]):
-            warnings.append(f"{name.upper()} was clipped to the physical dashboard range.")
-
-    tau_limits = {"c1": (0.01, 2.0, "r1"), "c2": (0.05, 20.0, "r2")}
-    for c_name, (tau_min, tau_max, r_name) in tau_limits.items():
-        tau = clean[r_name] * clean[c_name]
-        clipped_tau = float(np.clip(tau, tau_min, tau_max))
-        if not np.isclose(tau, clipped_tau):
-            clean[c_name] = float(np.clip(clipped_tau / max(clean[r_name], 1e-9), *ECM_PARAM_LIMITS[c_name]))
-            warnings.append(f"{c_name.upper()} was adjusted so the {r_name.upper()}-{c_name.upper()} time constant stays realistic.")
-
-    return clean, warnings
 
 
 def ecm_impedance_response(params: dict[str, float], frequencies_hz: np.ndarray, enable_warburg: bool = True) -> np.ndarray:
@@ -929,14 +858,10 @@ def ecm_impedance_response(params: dict[str, float], frequencies_hz: np.ndarray,
     return z_real + 1j * z_imag
 
 
-def build_impedance_validation(cycle_frame: pd.DataFrame, params: dict[str, float]) -> tuple[dict[str, object], go.Figure, go.Figure, pd.DataFrame]:
+def build_impedance_validation(cycle_frame: pd.DataFrame, params: dict[str, float] | None = None) -> tuple[dict[str, object], go.Figure, go.Figure, pd.DataFrame]:
     frequencies = np.geomspace(0.01, 10000.0, 300)
     
-    # Build clean_params directly from adaptive frame medians
-    clean_params = get_adaptive_ecm_params(cycle_frame)
-    clean_params["warburg_aw"] = params.get("warburg_aw", 0.015)
-    
-    clean_params, param_warnings = sanitize_ecm_impedance_params(clean_params, cycle_frame)
+    clean_params = get_frequency_domain_params(cycle_frame)
     z_model = ecm_impedance_response(clean_params, frequencies)
     z_real = np.real(z_model)
     z_imag = np.imag(z_model)
@@ -986,12 +911,6 @@ def build_impedance_validation(cycle_frame: pd.DataFrame, params: dict[str, floa
     high_freq_intercept = float(z_real[-1])
     low_freq_impedance = float(z_mag[0])
     min_magnitude = float(np.nanmin(z_mag))
-    warnings = list(dict.fromkeys(param_warnings))
-    
-    # We remove verbose string warnings, replacing them with simple status keys if needed.
-    # The user asked to remove verbose warnings and use compact status badges in UI.
-    # So we'll just keep metrics and let UI handle them.
-    insights = []
     
     if eis_frame.empty:
         metrics: dict[str, object] = {"impedance_rmse": np.nan, "phase_rmse_deg": np.nan}
@@ -1245,6 +1164,7 @@ def main() -> None:
     adaptive_diagnostics = []
 
     physics_shadow = detail_shadow.copy()
+    runtime_consistency = validate_ecm_consistency(detail_shadow, detail_cycle_shadow)
     efficiency_table = compute_efficiency_trends(compute_cycle_efficiency(detail_shadow))
     validation_metrics = compute_validation_metrics(detail_shadow) if not detail_shadow.empty else {"voltage": {}, "soc": {}}
 
@@ -1801,6 +1721,14 @@ def main() -> None:
 
     with diagnostics_tab:
         st.markdown("### Technical Diagnostics Logs")
+        consistency = global_data.get("ecm_consistency", {})
+        consistency_warnings = list(consistency.get("warnings", [])) + list(runtime_consistency.get("warnings", []))
+        with st.expander("ECM Architecture Consistency", expanded=bool(consistency_warnings)):
+            if consistency_warnings:
+                for warning in dict.fromkeys(consistency_warnings):
+                    st.warning(warning)
+            else:
+                st.success("Adaptive ECM artifacts, simulation traces, and render state are consistent.")
         
         # Anomaly Visualization
         st.markdown("#### Multivariate Anomaly Scores")

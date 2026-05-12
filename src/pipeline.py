@@ -9,9 +9,11 @@ import pandas as pd
 
 from .data_loader import load_shadow_tables
 from .ecm import (
+    ECMParameters,
     attach_ecm_state,
-    adaptive_r0,
     ekf_voltage_error_metrics,
+    get_adaptive_ecm_state,
+    validate_ecm_consistency,
     voltage_error_metrics,
     interpolate_ocv,
 )
@@ -143,7 +145,7 @@ def export_dashboard_artifacts(result: dict[str, object], output_dir: str | Path
     output_dir.mkdir(parents=True, exist_ok=True)
 
     paths: dict[str, str] = {}
-    global_frames = ("cycle_table", "cycle_shadow", "ocv_curve", "impedance_trend", "impedance_curve", "aligned_r0", "eis_reference")
+    global_frames = ("cycle_table", "cycle_shadow", "ocv_curve", "impedance_trend", "impedance_curve", "eis_reference")
 
     for key in global_frames:
         value = result.get(key)
@@ -216,6 +218,12 @@ def export_dashboard_artifacts(result: dict[str, object], output_dir: str | Path
         imp_met_path = output_dir / "impedance_metrics.json"
         imp_met_path.write_text(json.dumps(imp_met, indent=2), encoding="utf-8")
         paths["impedance_metrics"] = str(imp_met_path)
+
+    consistency = result.get("ecm_consistency", {})
+    if consistency:
+        consistency_path = output_dir / "ecm_consistency.json"
+        consistency_path.write_text(json.dumps(consistency, indent=2), encoding="utf-8")
+        paths["ecm_consistency"] = str(consistency_path)
         
     s_met = result.get("scaling_metrics", {})
     if s_met:
@@ -242,6 +250,8 @@ def export_dashboard_artifacts(result: dict[str, object], output_dir: str | Path
         manifest["r0_validation_path"] = paths["r0_validation"]
     if "impedance_metrics" in paths:
         manifest["impedance_metrics_path"] = paths["impedance_metrics"]
+    if "ecm_consistency" in paths:
+        manifest["ecm_consistency_path"] = paths["ecm_consistency"]
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     paths["manifest"] = str(manifest_path)
@@ -265,13 +275,21 @@ def build_and_export_dashboard_artifacts(
     sample_state = result.get("sample_state")
     cycle_shadow = result.get("cycle_shadow")
     if isinstance(sample_state, pd.DataFrame) and isinstance(cycle_shadow, pd.DataFrame):
+        estimated_imp = process_battery_impedance(sample_state)
+        sample_state_for_ecm = sample_state.copy()
+        if not estimated_imp.empty:
+            sample_state_for_ecm = sample_state_for_ecm.merge(
+                estimated_imp,
+                on=["battery_id", "cycle_index"],
+                how="left",
+            )
         battery_frames: list[pd.DataFrame] = []
         battery_metrics: dict[str, dict[str, float]] = {}
         battery_params: dict[str, dict[str, float]] = {}
         all_batt_cycles: dict[str, pd.DataFrame] = {}
         all_batt_ocv: dict[str, pd.DataFrame] = {}
 
-        for battery_id, group in sample_state.groupby("battery_id"):
+        for battery_id, group in sample_state_for_ecm.groupby("battery_id"):
             ecm_input = group.copy()
             if ecm_sample_limit is not None and len(ecm_input) > ecm_sample_limit:
                 ecm_input = ecm_input.head(ecm_sample_limit).copy()
@@ -341,49 +359,42 @@ def build_and_export_dashboard_artifacts(
             cycle_shadow["cycle_ekf_mae_v"] = pd.NA
             cycle_shadow["cycle_ekf_rmse_v"] = pd.NA
 
+            if not estimated_imp.empty:
+                cycle_shadow = cycle_shadow.merge(estimated_imp, on=["battery_id", "cycle_index"], how="left")
+            else:
+                cycle_shadow["estimated_impedance_ohm"] = np.nan
+                cycle_shadow["estimated_impedance_smoothed_ohm"] = np.nan
+
+            sample_ecm_cols = ["r0", "r1", "r2", "c1", "c2", "warburg_aw", "tau1", "tau2"]
+            sample_ecm_summary = (
+                result["sample_shadow"]
+                .groupby(["battery_id", "cycle_index"], as_index=False)[sample_ecm_cols]
+                .median(numeric_only=True)
+            )
+
             for battery_id, params in battery_params.items():
                 battery_mask = cycle_shadow["battery_id"] == battery_id
                 battery_frame = cycle_shadow.loc[battery_mask].copy()
                 if battery_frame.empty:
                     continue
-
-                soh_reference = battery_frame["soh"].ffill().bfill().fillna(1.0)
-                resistance_reference = battery_frame["total_resistance_ohm"].ffill().bfill()
-
-                if resistance_reference.notna().any():
-                    res_min = resistance_reference.min()
-                    res_max = resistance_reference.max()
-                    if pd.notna(res_min) and pd.notna(res_max) and abs(res_max - res_min) > 1e-12:
-                        resistance_scale = (resistance_reference - res_min) / (res_max - res_min)
-                    else:
-                        resistance_scale = pd.Series(0.0, index=battery_frame.index)
-                else:
-                    resistance_scale = pd.Series(0.0, index=battery_frame.index)
-
-                aging_scale = (1.0 - soh_reference).clip(lower=0.0).fillna(0.0)
-
-                # --- Adaptive R0: physics-based per-cycle computation ---
-                soh_series = battery_frame["soh"].ffill().bfill().fillna(1.0) if "soh" in battery_frame.columns else pd.Series(1.0, index=battery_frame.index)
-                
-                # We need ECMParameters instance
-                from .ecm import ECMParameters
                 base_params = ECMParameters(**params) if isinstance(params, dict) else params
-
-                from .ecm import get_dynamic_params
-                dynamic_params = get_dynamic_params(
-                    battery_frame["discharge_soc_mean"].fillna(
-                        battery_frame.get("charge_soc_mean", pd.Series(0.5, index=battery_frame.index))
-                    ).fillna(0.5),
-                    battery_frame["temperature_mean_c"].ffill().bfill().fillna(25.0),
-                    soh_series,
-                    base_params,
-                )
-
-                cycle_shadow.loc[battery_mask, "r0"] = dynamic_params["r0_dynamic"].values
-                cycle_shadow.loc[battery_mask, "r1"] = dynamic_params["r1_dynamic"].values
-                cycle_shadow.loc[battery_mask, "r2"] = dynamic_params["r2_dynamic"].values
-                cycle_shadow.loc[battery_mask, "c1"] = dynamic_params["c1_dynamic"].values
-                cycle_shadow.loc[battery_mask, "c2"] = dynamic_params["c2_dynamic"].values
+                adaptive_state = get_adaptive_ecm_state(battery_frame, base_params)
+                for column, values in adaptive_state.items():
+                    cycle_shadow.loc[battery_mask, column] = values
+                sample_battery_summary = sample_ecm_summary[sample_ecm_summary["battery_id"] == battery_id]
+                if not sample_battery_summary.empty:
+                    cycle_shadow = cycle_shadow.merge(
+                        sample_battery_summary,
+                        on=["battery_id", "cycle_index"],
+                        how="left",
+                        suffixes=("", "_sample_adaptive"),
+                    )
+                    for column in sample_ecm_cols:
+                        sample_column = f"{column}_sample_adaptive"
+                        if sample_column in cycle_shadow.columns:
+                            mask = battery_mask & cycle_shadow[sample_column].notna()
+                            cycle_shadow.loc[mask, column] = cycle_shadow.loc[mask, sample_column]
+                            cycle_shadow = cycle_shadow.drop(columns=[sample_column])
 
                 # --- Group 1 Physics Features ---
                 battery_rows = cycle_shadow.loc[battery_mask].copy()
@@ -416,23 +427,22 @@ def build_and_export_dashboard_artifacts(
                 cycle_shadow.loc[battery_mask, "cycle_ekf_mae_v"] = metrics.get("ekf_mae_v")
                 cycle_shadow.loc[battery_mask, "cycle_ekf_rmse_v"] = metrics.get("ekf_rmse_v")
 
-            estimated_imp = process_battery_impedance(sample_state)
-            if not estimated_imp.empty:
-                cycle_shadow = cycle_shadow.merge(estimated_imp, on=["battery_id", "cycle_index"], how="left")
-            else:
-                cycle_shadow["estimated_impedance_ohm"] = np.nan
-
             r0_validation = {}
             impedance_metrics = {}
             trend_frames = []
             scaling_metrics = {}
-            aligned_r0_frames = []
             eis_ref_frames = []
 
             for battery_id in battery_params.keys():
                 battery_mask = cycle_shadow["battery_id"] == battery_id
                 battery_frame = cycle_shadow.loc[battery_mask].copy()
                 
+                cycle_shadow.loc[battery_mask, "r_total"] = (
+                    cycle_shadow.loc[battery_mask, "r0"] +
+                    cycle_shadow.loc[battery_mask, "r1"] +
+                    cycle_shadow.loc[battery_mask, "r2"]
+                )
+
                 if "re_ohm" in battery_frame.columns:
                     valid_eis = battery_frame.dropna(subset=["re_ohm", "r0"])
                     if not valid_eis.empty:
@@ -442,44 +452,26 @@ def build_and_export_dashboard_artifacts(
                         r0_ref_mean = float(np.mean(r0_ref_series))
                         r0_pred_mean = float(np.mean(r0_pred_series))
                         
-                        if r0_pred_mean > 0:
-                            scale_factor = r0_ref_mean / r0_pred_mean
-                        else:
-                            scale_factor = 1.0
-                            
-                        cycle_shadow.loc[battery_mask, "r0_aligned"] = cycle_shadow.loc[battery_mask, "r0"] * scale_factor
-                        # Calculate total aligned resistance for better pulse validation
-                        cycle_shadow.loc[battery_mask, "r_total_aligned"] = (
-                            cycle_shadow.loc[battery_mask, "r0"] + 
-                            cycle_shadow.loc[battery_mask, "r1"] + 
-                            cycle_shadow.loc[battery_mask, "r2"]
-                        ) * scale_factor
-                        
                         scaling_metrics[battery_id] = {
                             "mean_predicted_r0": r0_pred_mean,
                             "mean_eis_r0": r0_ref_mean,
-                            "scale_factor": float(scale_factor),
-                            "normalization_detected": bool(scale_factor > 10.0 or scale_factor < 0.1),
-                            "unit_consistency": "Ohms (aligned)",
-                            "outlier_counts": int(np.sum((r0_pred_series * scale_factor > 1.0) | (r0_pred_series * scale_factor < 0.0)))
+                            "scale_factor": 1.0,
+                            "normalization_detected": False,
+                            "unit_consistency": "Ohms (adaptive artifact state)",
+                            "outlier_counts": int(np.sum((r0_pred_series > 1.0) | (r0_pred_series < 0.0)))
                         }
                         
-                        aligned_r0_frames.append(cycle_shadow.loc[battery_mask, ["battery_id", "cycle_index", "r0", "r0_aligned"]])
                         eis_ref_frames.append(valid_eis[["battery_id", "cycle_index", "re_ohm"]])
-                    else:
-                        cycle_shadow.loc[battery_mask, "r0_aligned"] = cycle_shadow.loc[battery_mask, "r0"]
-                else:
-                    cycle_shadow.loc[battery_mask, "r0_aligned"] = cycle_shadow.loc[battery_mask, "r0"]
 
                 imp_col = (
                     "estimated_impedance_smoothed_ohm"
                     if "estimated_impedance_smoothed_ohm" in cycle_shadow.columns
                     else "estimated_impedance_ohm"
                 )
-                val_frame = cycle_shadow.loc[battery_mask].dropna(subset=["r_total_aligned", imp_col])
+                val_frame = cycle_shadow.loc[battery_mask].dropna(subset=["r_total", imp_col])
                 if not val_frame.empty:
                     # Compare Total Model Resistance to Total Pulse Impedance
-                    val = validate_r0(val_frame["r_total_aligned"], val_frame[imp_col])
+                    val = validate_r0(val_frame["r_total"], val_frame[imp_col])
                     r0_validation[battery_id] = val
                     
                     trend = analyze_impedance_growth(val_frame["cycle_index"], val_frame[imp_col])
@@ -498,6 +490,7 @@ def build_and_export_dashboard_artifacts(
             result["r0_validation"] = r0_validation
             result["impedance_metrics"] = impedance_metrics
             result["scaling_metrics"] = scaling_metrics
+            result["ecm_consistency"] = validate_ecm_consistency(result.get("sample_shadow"), cycle_shadow)
             result["global_models"] = {
                 "stress_coeffs": stress_coeffs,
                 "pooled_rul_r2": pooled_rul.get("loco_r2", []),
@@ -540,10 +533,15 @@ def build_and_export_dashboard_artifacts(
                 if "estimated_impedance_smoothed_ohm" in cycle_shadow.columns
                 else "estimated_impedance_ohm"
             )
-            curve_cols = ["battery_id", "cycle_index", "r0_aligned", imp_col_global]
-            result["impedance_curve"] = cycle_shadow.dropna(subset=["r0_aligned", imp_col_global])[curve_cols].rename(columns={"r0_aligned": "r0", imp_col_global: "estimated_impedance_ohm"}) if not cycle_shadow.empty else pd.DataFrame()
+            curve_cols = ["battery_id", "cycle_index", "r0", imp_col_global]
+            if not cycle_shadow.empty:
+                impedance_curve = cycle_shadow.dropna(subset=["r0", imp_col_global])[curve_cols].copy()
+                if imp_col_global != "estimated_impedance_smoothed_ohm":
+                    impedance_curve = impedance_curve.rename(columns={imp_col_global: "estimated_impedance_smoothed_ohm"})
+                result["impedance_curve"] = impedance_curve
+            else:
+                result["impedance_curve"] = pd.DataFrame()
             
-            result["aligned_r0"] = pd.concat(aligned_r0_frames, ignore_index=True) if aligned_r0_frames else pd.DataFrame()
             result["eis_reference"] = pd.concat(eis_ref_frames, ignore_index=True) if eis_ref_frames else pd.DataFrame()
 
     return export_dashboard_artifacts(result, output_dir)
