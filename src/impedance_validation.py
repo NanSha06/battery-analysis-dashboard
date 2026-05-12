@@ -19,33 +19,56 @@ def detect_current_pulses(current: np.ndarray | pd.Series, threshold: float = 0.
     
     return pulse_indices
 
-def estimate_impedance(voltage: np.ndarray | pd.Series, current: np.ndarray | pd.Series, pulse_indices: np.ndarray) -> np.ndarray:
+def estimate_impedance(
+    voltage: np.ndarray | pd.Series,
+    current: np.ndarray | pd.Series,
+    pulse_indices: np.ndarray,
+    smooth_window: int = 3,
+) -> np.ndarray:
     """
     Estimate impedance Z_est = delta_V / delta_I at the given pulse indices.
+
+    Uses a centred moving-window average over ``smooth_window`` adjacent
+    pulse points to suppress single-sample noise spikes.
     """
     v_arr = np.asarray(voltage, dtype=float)
     i_arr = np.asarray(current, dtype=float)
-    
-    impedance_est = []
-    
+
+    raw_impedances: list[float] = []
+
     for idx in pulse_indices:
         if idx + 1 >= len(v_arr):
             continue
-            
-        delta_v = v_arr[idx + 1] - v_arr[idx]
-        delta_i = i_arr[idx + 1] - i_arr[idx]
-        
-        # Avoid divide-by-zero or extremely small current changes
+
+        # Use a small window around the pulse edge for robust ΔV/ΔI
+        lo = max(0, idx - smooth_window // 2)
+        hi = min(len(v_arr) - 1, idx + 1 + smooth_window // 2)
+
+        delta_v = float(np.mean(v_arr[idx + 1 : hi + 1]) - np.mean(v_arr[lo : idx + 1]))
+        delta_i = float(np.mean(i_arr[idx + 1 : hi + 1]) - np.mean(i_arr[lo : idx + 1]))
+
         if abs(delta_i) < 1e-6:
             continue
-            
+
         z = abs(delta_v / delta_i)
-        
-        # Ignore physically unrealistic values (e.g. > 10 Ohms or < 1e-5 Ohms)
-        if 1e-5 <= z <= 10.0:
-            impedance_est.append(z)
-            
-    return np.array(impedance_est, dtype=float)
+
+        # Physical range gate
+        if 1e-4 <= z <= 5.0:
+            raw_impedances.append(z)
+
+    if len(raw_impedances) == 0:
+        return np.array([], dtype=float)
+
+    raw = np.array(raw_impedances, dtype=float)
+
+    # --- Adaptive outlier rejection (median ± 2.5 MAD) ---
+    med = float(np.median(raw))
+    mad = float(np.median(np.abs(raw - med)))
+    if mad > 1e-9:
+        mask = np.abs(raw - med) <= 2.5 * mad
+        raw = raw[mask]
+
+    return raw if len(raw) > 0 else np.array([med], dtype=float)
 
 import warnings
 
@@ -140,34 +163,82 @@ def analyze_impedance_growth(cycles: np.ndarray | pd.Series, impedance: np.ndarr
     
     return df
 
+def smooth_impedance_series(
+    impedance_values: np.ndarray | pd.Series,
+    window: int = 5,
+) -> np.ndarray:
+    """Apply a rolling median + EMA filter to an impedance time-series.
+
+    This two-stage filter removes isolated spikes (median) then smooths
+    the residual oscillation (exponential moving average).
+    """
+    arr = np.asarray(impedance_values, dtype=float)
+    if len(arr) < 2:
+        return arr
+
+    # Stage 1: rolling median (removes spikes)
+    s = pd.Series(arr)
+    med = s.rolling(window=window, min_periods=1, center=True).median()
+
+    # Stage 2: exponential moving average (smooths oscillation)
+    alpha = 2.0 / (window + 1)
+    ema = med.ewm(alpha=alpha, adjust=False).mean()
+
+    return ema.to_numpy(dtype=float)
+
+
 def process_battery_impedance(sample_table: pd.DataFrame) -> pd.DataFrame:
     """
-    Process sample-level data for a battery to extract cycle-level impedance estimates.
+    Process sample-level data for a battery to extract cycle-level impedance
+    estimates with smoothing to reduce oscillatory noise.
     """
     if sample_table.empty:
-        return pd.DataFrame(columns=["battery_id", "cycle_index", "estimated_impedance_ohm"])
-        
-    results = []
-    
-    for (battery_id, cycle_index), group in sample_table.groupby(["battery_id", "cycle_index"], sort=False):
+        return pd.DataFrame(columns=[
+            "battery_id", "cycle_index",
+            "estimated_impedance_ohm", "estimated_impedance_smoothed_ohm",
+        ])
+
+    results: list[dict] = []
+
+    for (battery_id, cycle_index), group in sample_table.groupby(
+        ["battery_id", "cycle_index"], sort=False
+    ):
         if len(group) < 10:
             continue
-            
+
         pulses = detect_current_pulses(group["current_a"])
         if len(pulses) == 0:
             continue
-            
-        impedances = estimate_impedance(group["voltage_v"], group["current_a"], pulses)
-        
+
+        impedances = estimate_impedance(
+            group["voltage_v"], group["current_a"], pulses
+        )
+
         if len(impedances) > 0:
-            mean_imp = float(np.mean(impedances))
+            # Use median (robust to outliers) instead of mean
+            median_imp = float(np.median(impedances))
             results.append({
                 "battery_id": battery_id,
                 "cycle_index": cycle_index,
-                "estimated_impedance_ohm": mean_imp
+                "estimated_impedance_ohm": median_imp,
             })
-            
-    return pd.DataFrame(results)
+
+    df = pd.DataFrame(results)
+
+    if not df.empty:
+        # Apply cross-cycle smoothing per battery
+        smoothed_parts = []
+        for _bid, grp in df.groupby("battery_id", sort=False):
+            grp = grp.sort_values("cycle_index").copy()
+            grp["estimated_impedance_smoothed_ohm"] = smooth_impedance_series(
+                grp["estimated_impedance_ohm"].values
+            )
+            smoothed_parts.append(grp)
+        df = pd.concat(smoothed_parts, ignore_index=True)
+    else:
+        df["estimated_impedance_smoothed_ohm"] = np.nan
+
+    return df
 
 
 ANOMALY_FEATURES = [

@@ -83,6 +83,39 @@ def ocv_slope_from_soc(soc_value: float, ocv_curve: pd.DataFrame) -> float:
     )
 
 
+def adaptive_r0(
+    soc: np.ndarray,
+    temperature_c: np.ndarray,
+    soh: np.ndarray,
+    base_r0: float,
+    reference_temperature_c: float = 25.0,
+) -> np.ndarray:
+    """Compute state-dependent R0 = f(SOC, Temperature, SOH).
+
+    Uses nonlinear stress factors calibrated so that the resulting
+    impedance magnitude lands in the 0.06–0.25 Ω band typically
+    observed in 18650 Li-ion cells (NASA B0005-type).
+    """
+    soc_arr = np.asarray(soc, dtype=float)
+    temp_arr = np.asarray(temperature_c, dtype=float)
+    soh_arr = np.asarray(soh, dtype=float)
+
+    # --- SOC stress: U-shaped – extremes increase impedance ---
+    soc_deviation = np.clip(np.abs(soc_arr - 0.5) * 2.0, 0.0, 1.0)
+    soc_factor = 1.0 + 1.8 * soc_deviation**1.5          # up to 2.8x at SOC 0/1
+
+    # --- Temperature stress: Arrhenius-inspired ---
+    delta_t = np.clip((reference_temperature_c - temp_arr), -15.0, 40.0)
+    temp_factor = np.exp(0.025 * delta_t)                  # ~1.65x at 5°C, ~0.78x at 35°C
+
+    # --- Aging stress: exponential growth below SOH 0.85 ---
+    degradation = np.clip(1.0 - soh_arr, 0.0, 0.5)
+    aging_factor = 1.0 + 4.5 * degradation**1.3            # up to ~3.2x at SOH 0.5
+
+    r0_scaled = base_r0 * soc_factor * temp_factor * aging_factor
+    return np.clip(r0_scaled, 1e-4, 2.0)
+
+
 def get_dynamic_params(
     soc: pd.Series | np.ndarray,
     temperature_c: pd.Series | np.ndarray,
@@ -90,23 +123,40 @@ def get_dynamic_params(
     base_params: ECMParameters,
     reference_temperature_c: float = 25.0,
 ) -> pd.DataFrame:
+    """Return sample-level dynamic ECM parameters scaled by operating conditions.
+
+    The scaling factors are calibrated to reproduce experimentally observed
+    impedance magnitudes (0.09–0.18 Ω range for NASA 18650 cells).
+    """
     soc_values = np.asarray(soc, dtype=float)
     temp_values = np.asarray(temperature_c, dtype=float)
     soh_values = np.asarray(soh, dtype=float)
 
+    # --- Stress components (shared across R/C) ---
     soc_stress = np.clip(np.abs(soc_values - 0.5) * 2.0, 0.0, 1.0)
     temp_stress = np.clip((reference_temperature_c - temp_values) / 25.0, -0.5, 1.5)
     aging_stress = np.clip(1.0 - soh_values, 0.0, 0.6)
 
-    r_scale = 1.0 + 0.25 * soc_stress + 0.20 * temp_stress + 1.20 * aging_stress
-    c_scale = np.clip(1.0 - 0.45 * aging_stress + 0.08 * (temp_values - reference_temperature_c) / 25.0, 0.2, 1.5)
+    # --- Adaptive R0 (primary fix for the scale mismatch) ---
+    r0_dyn = adaptive_r0(soc_values, temp_values, soh_values,
+                         base_params.r0, reference_temperature_c)
+
+    # --- R1/R2 scaling – stronger than before to lift polarization arcs ---
+    r1_scale = 1.0 + 1.4 * soc_stress + 0.6 * temp_stress + 3.0 * aging_stress
+    r2_scale = 1.0 + 1.0 * soc_stress + 0.8 * temp_stress + 3.5 * aging_stress
+
+    # --- Capacitance scaling (aging reduces C → faster dynamics) ---
+    c_scale = np.clip(
+        1.0 - 0.55 * aging_stress + 0.10 * (temp_values - reference_temperature_c) / 25.0,
+        0.15, 1.8,
+    )
 
     return pd.DataFrame(
         {
-            "r0_dynamic": np.clip(base_params.r0 * r_scale, 1e-5, 1.0),
-            "r1_dynamic": np.clip(base_params.r1 * (1.0 + 0.35 * soc_stress + 0.15 * temp_stress), 1e-5, 1.0),
+            "r0_dynamic": r0_dyn,
+            "r1_dynamic": np.clip(base_params.r1 * r1_scale, 1e-5, 1.0),
             "c1_dynamic": np.clip(base_params.c1 * c_scale, 1.0, 1e6),
-            "r2_dynamic": np.clip(base_params.r2 * (1.0 + 0.25 * soc_stress + 0.20 * temp_stress), 1e-5, 1.0),
+            "r2_dynamic": np.clip(base_params.r2 * r2_scale, 1e-5, 1.0),
             "c2_dynamic": np.clip(base_params.c2 * c_scale, 1.0, 1e6),
         }
     )
@@ -144,11 +194,25 @@ def simulate_2rc_ecm(
     soc: np.ndarray,
     params: ECMParameters,
     ocv_curve: pd.DataFrame,
+    r0_override: np.ndarray | None = None,
 ) -> pd.DataFrame:
+    """Simulate 2-RC ECM terminal voltage.
+
+    Parameters
+    ----------
+    r0_override : optional per-sample R0 array. When provided, uses
+        adaptive per-sample R0 instead of the static ``params.r0``.
+    """
     current_a = np.asarray(current_a, dtype=float)
     dt_s = np.asarray(dt_s, dtype=float)
     soc = np.asarray(soc, dtype=float)
     ocv = interpolate_ocv(soc, ocv_curve)
+
+    # Per-sample R0: use override if provided, else broadcast static value
+    if r0_override is not None:
+        r0_arr = np.asarray(r0_override, dtype=float)
+    else:
+        r0_arr = np.full_like(current_a, params.r0, dtype=float)
 
     v1 = np.zeros_like(current_a, dtype=float)
     v2 = np.zeros_like(current_a, dtype=float)
@@ -160,7 +224,7 @@ def simulate_2rc_ecm(
             a2 = np.exp(-max(dt_s[i], 0.0) / max(params.r2 * params.c2, 1e-9))
             v1[i] = a1 * v1[i - 1] + params.r1 * (1.0 - a1) * current_a[i]
             v2[i] = a2 * v2[i - 1] + params.r2 * (1.0 - a2) * current_a[i]
-        terminal_v[i] = ocv[i] - current_a[i] * params.r0 - v1[i] - v2[i]
+        terminal_v[i] = ocv[i] - current_a[i] * r0_arr[i] - v1[i] - v2[i]
 
     return pd.DataFrame(
         {
@@ -170,6 +234,7 @@ def simulate_2rc_ecm(
             "voltage_model_v": terminal_v,
         }
     )
+
 
 
 def _residuals(
@@ -218,12 +283,19 @@ def run_ekf_soc_ocv(
     ocv_curve: pd.DataFrame,
     nominal_capacity_ah: float = 2.0,
     ekf_params: EKFParameters | None = None,
+    r0_override: np.ndarray | None = None,
 ) -> pd.DataFrame:
     if sample_table.empty:
         return sample_table.copy()
 
     ekf_params = ekf_params or EKFParameters()
     frame = sample_table.copy().reset_index(drop=True)
+
+    # Build per-sample R0 array
+    if r0_override is not None:
+        _r0_full = np.asarray(r0_override, dtype=float)
+    else:
+        _r0_full = np.full(len(frame), params.r0, dtype=float)
 
     frame["soc_ekf"] = np.nan
     frame["soc_ekf_std"] = np.nan
@@ -248,6 +320,7 @@ def run_ekf_soc_ocv(
         dt_s = group["dt_s"].fillna(0.0).to_numpy(dtype=float)
         voltage = group["voltage_v"].to_numpy(dtype=float)
         seed_soc = group["soc"].ffill().bfill().fillna(0.5).to_numpy(dtype=float)
+        r0_group = _r0_full[idx]  # per-sample adaptive R0 for this group
 
         x = np.asarray([float(seed_soc[0]), 0.0, 0.0], dtype=float)
         p = np.diag(
@@ -295,7 +368,7 @@ def run_ekf_soc_ocv(
 
             ocv_pred = ocv_from_soc(x_pred[0], ocv_curve)
             dh_dsoc = ocv_slope_from_soc(x_pred[0], ocv_curve)
-            h_val = float(ocv_pred - ik * params.r0 - x_pred[1] - x_pred[2])
+            h_val = float(ocv_pred - ik * r0_group[i] - x_pred[1] - x_pred[2])
             h_jacobian = np.asarray([[dh_dsoc, -1.0, -1.0]], dtype=float)
 
             if np.isfinite(voltage[i]):

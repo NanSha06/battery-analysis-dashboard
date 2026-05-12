@@ -10,6 +10,7 @@ import pandas as pd
 from .data_loader import load_shadow_tables
 from .ecm import (
     attach_ecm_state,
+    adaptive_r0,
     ekf_voltage_error_metrics,
     voltage_error_metrics,
     interpolate_ocv,
@@ -361,9 +362,40 @@ def build_and_export_dashboard_artifacts(
 
                 aging_scale = (1.0 - soh_reference).clip(lower=0.0).fillna(0.0)
 
-                cycle_shadow.loc[battery_mask, "r0"] = float(params["r0"]) * (1.0 + 0.6 * resistance_scale)
-                cycle_shadow.loc[battery_mask, "r1"] = float(params["r1"]) * (1.0 + 1.2 * resistance_scale)
-                cycle_shadow.loc[battery_mask, "r2"] = float(params["r2"]) * (1.0 + 0.8 * resistance_scale)
+                # --- Adaptive R0: physics-based per-cycle computation ---
+                soc_arr = battery_frame["discharge_soc_mean"].fillna(
+                    battery_frame.get("charge_soc_mean", pd.Series(0.5, index=battery_frame.index))
+                ).fillna(0.5).to_numpy(float)
+                temp_arr = battery_frame["temperature_mean_c"].ffill().bfill().fillna(25.0).to_numpy(float)
+                soh_arr = soh_reference.to_numpy(float)
+                base_r0 = float(params["r0"])
+
+                r0_adaptive = adaptive_r0(soc_arr, temp_arr, soh_arr, base_r0)
+
+                # Current-dependent boost
+                if "current_mean_a" in battery_frame.columns:
+                    abs_cur = np.abs(battery_frame["current_mean_a"].fillna(0.0).to_numpy(float))
+                    r0_adaptive = r0_adaptive * (1.0 + 0.08 * np.clip(abs_cur - 1.0, 0.0, 5.0))
+
+                # Cycle-aging ramp: monotonic increase with cycle progression
+                cidx = battery_frame["cycle_index"].to_numpy(float)
+                if len(cidx) > 1:
+                    norm_cyc = (cidx - cidx.min()) / max(cidx.max() - cidx.min(), 1.0)
+                    r0_adaptive = r0_adaptive * (1.0 + 0.15 * norm_cyc)
+
+                # EMA smooth to remove noise
+                alpha = 2.0 / 6.0  # span=5
+                r0_smooth = np.empty_like(r0_adaptive)
+                r0_smooth[0] = r0_adaptive[0]
+                for _si in range(1, len(r0_adaptive)):
+                    r0_smooth[_si] = alpha * r0_adaptive[_si] + (1.0 - alpha) * r0_smooth[_si - 1]
+                r0_final = np.clip(r0_smooth, 1e-4, 2.0)
+
+                # Scale R1/R2 proportionally, C inversely with aging
+                r0_ratio = r0_final / max(base_r0, 1e-9)
+                cycle_shadow.loc[battery_mask, "r0"] = r0_final
+                cycle_shadow.loc[battery_mask, "r1"] = np.clip(float(params["r1"]) * r0_ratio * 0.75, 1e-5, 1.0)
+                cycle_shadow.loc[battery_mask, "r2"] = np.clip(float(params["r2"]) * r0_ratio * 0.75, 1e-5, 1.0)
                 cycle_shadow.loc[battery_mask, "c1"] = float(params["c1"]) * (1.0 - 0.5 * aging_scale)
                 cycle_shadow.loc[battery_mask, "c2"] = float(params["c2"]) * (1.0 - 0.3 * aging_scale)
 
