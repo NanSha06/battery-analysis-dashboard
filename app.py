@@ -812,51 +812,192 @@ def build_temperature_validation_plots(detail_shadow: pd.DataFrame, cycle_frame:
     return rmse_fig, resistance_fig
 
 
+ECM_PARAM_LIMITS = {
+    "r0": (1e-4, 1.0),
+    "r1": (1e-4, 1.0),
+    "r2": (1e-4, 1.0),
+    "c1": (1.0, 1e6),
+    "c2": (1.0, 1e6),
+}
+
+
+def _finite_median(frame: pd.DataFrame, column: str) -> float | None:
+    if column not in frame.columns:
+        return None
+    values = pd.to_numeric(frame[column], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    return float(values.median()) if not values.empty else None
+
+
+def sanitize_ecm_impedance_params(
+    params: dict[str, float],
+    cycle_frame: pd.DataFrame,
+) -> tuple[dict[str, float], list[str]]:
+    warnings: list[str] = []
+    clean: dict[str, float] = {}
+
+    for name, default in {"r0": 0.01, "r1": 0.01, "r2": 0.02, "c1": 2000.0, "c2": 4000.0}.items():
+        value = params.get(name, default)
+        clean[name] = float(value) if np.isfinite(value) else default
+
+    cycle_sources = {
+        "r0": ["r0_aligned", "r0"],
+        "r1": ["r1"],
+        "r2": ["r2"],
+        "c1": ["c1"],
+        "c2": ["c2"],
+    }
+    for name, columns in cycle_sources.items():
+        for column in columns:
+            median_value = _finite_median(cycle_frame, column)
+            if median_value is not None:
+                clean[name] = median_value
+                break
+
+    re_ref = _finite_median(cycle_frame, "re_ohm")
+    rct_ref = _finite_median(cycle_frame, "rct_ohm")
+    if re_ref is not None and re_ref > 0:
+        if clean["r0"] < 0.25 * re_ref or clean["r0"] > 4.0 * re_ref:
+            warnings.append("R0 was outside the EIS high-frequency intercept range and was aligned to measured Re(Z).")
+        clean["r0"] = re_ref if clean["r0"] < 0.25 * re_ref or clean["r0"] > 4.0 * re_ref else clean["r0"]
+
+    if rct_ref is not None and rct_ref > 0:
+        polarization = clean["r1"] + clean["r2"]
+        if polarization <= 0 or polarization < 0.25 * rct_ref or polarization > 4.0 * rct_ref:
+            ratio = clean["r1"] / polarization if polarization > 0 else 0.45
+            ratio = float(np.clip(ratio, 0.25, 0.75))
+            clean["r1"] = rct_ref * ratio
+            clean["r2"] = rct_ref * (1.0 - ratio)
+            warnings.append("R1 + R2 was aligned to measured charge-transfer resistance to avoid near-zero Bode magnitude.")
+
+    for name, (lower, upper) in ECM_PARAM_LIMITS.items():
+        before = clean[name]
+        clean[name] = float(np.clip(before, lower, upper))
+        if not np.isclose(before, clean[name]):
+            warnings.append(f"{name.upper()} was clipped to the physical dashboard range.")
+
+    tau_limits = {"c1": (0.01, 2.0, "r1"), "c2": (0.05, 20.0, "r2")}
+    for c_name, (tau_min, tau_max, r_name) in tau_limits.items():
+        tau = clean[r_name] * clean[c_name]
+        clipped_tau = float(np.clip(tau, tau_min, tau_max))
+        if not np.isclose(tau, clipped_tau):
+            clean[c_name] = float(np.clip(clipped_tau / max(clean[r_name], 1e-9), *ECM_PARAM_LIMITS[c_name]))
+            warnings.append(f"{c_name.upper()} was adjusted so the {r_name.upper()}-{c_name.upper()} time constant stays realistic.")
+
+    return clean, warnings
+
+
 def ecm_impedance_response(params: dict[str, float], frequencies_hz: np.ndarray) -> np.ndarray:
     r0 = float(params.get("r0", 0.01))
     r1 = float(params.get("r1", 0.01))
     c1 = float(params.get("c1", 2000.0))
     r2 = float(params.get("r2", 0.02))
     c2 = float(params.get("c2", 4000.0))
+    frequencies_hz = np.asarray(frequencies_hz, dtype=float)
     omega = 2.0 * np.pi * frequencies_hz
-    return r0 + r1 / (1.0 + 1j * omega * r1 * c1) + r2 / (1.0 + 1j * omega * r2 * c2)
+
+    x1 = omega * r1 * c1
+    x2 = omega * r2 * c2
+    z_real = r0 + r1 / (1.0 + x1**2) + r2 / (1.0 + x2**2)
+    z_imag = -(r1 * x1 / (1.0 + x1**2) + r2 * x2 / (1.0 + x2**2))
+    return z_real + 1j * z_imag
 
 
-def build_impedance_validation(cycle_frame: pd.DataFrame, params: dict[str, float]) -> tuple[dict[str, float], go.Figure, go.Figure]:
-    frequencies = np.logspace(-3, 3, 160)
-    z_model = ecm_impedance_response(params, frequencies)
+def build_impedance_validation(cycle_frame: pd.DataFrame, params: dict[str, float]) -> tuple[dict[str, object], go.Figure, go.Figure, pd.DataFrame]:
+    frequencies = np.geomspace(0.1, 5000.0, 220)
+    clean_params, param_warnings = sanitize_ecm_impedance_params(params, cycle_frame)
+    z_model = ecm_impedance_response(clean_params, frequencies)
+    z_real = np.real(z_model)
+    z_imag = np.imag(z_model)
+    z_mag = np.sqrt(z_real**2 + z_imag**2)
+    z_phase = np.degrees(np.arctan2(z_imag, z_real))
     eis_frame = cycle_frame.dropna(subset=["re_ohm", "rct_ohm"]).copy() if {"re_ohm", "rct_ohm"}.issubset(cycle_frame.columns) else pd.DataFrame()
 
     nyquist = go.Figure()
-    nyquist.add_trace(go.Scatter(x=np.real(z_model), y=-np.imag(z_model), mode="lines", name="ECM"))
+    nyquist.add_trace(go.Scatter(x=z_real, y=-z_imag, mode="lines", name="ECM 2RC"))
     if not eis_frame.empty:
         nyquist.add_trace(go.Scatter(x=eis_frame["re_ohm"], y=np.zeros(len(eis_frame)), mode="markers", name="Experimental EIS Re"))
         nyquist.add_trace(go.Scatter(x=eis_frame["re_ohm"] + eis_frame["rct_ohm"], y=eis_frame["rct_ohm"] / 2.0, mode="markers", name="Experimental EIS Arc"))
     nyquist.update_layout(title="Nyquist: Experimental EIS vs ECM", xaxis_title="Z real (Ohm)", yaxis_title="-Z imag (Ohm)", height=430)
 
     bode = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.10, subplot_titles=("Magnitude", "Phase"))
-    bode.add_trace(go.Scatter(x=frequencies, y=np.abs(z_model), mode="lines", name="ECM |Z|"), row=1, col=1)
-    bode.add_trace(go.Scatter(x=frequencies, y=np.angle(z_model, deg=True), mode="lines", name="ECM Phase"), row=2, col=1)
+    bode.add_trace(go.Scatter(x=frequencies, y=z_mag, mode="lines", name="ECM |Z|", line=dict(color="#58a6ff", width=2)), row=1, col=1)
+    bode.add_trace(go.Scatter(x=frequencies, y=z_phase, mode="lines", name="ECM Phase", line=dict(color="#7ee787", width=2)), row=2, col=1)
+    exp_mag = np.array([], dtype=float)
+    exp_phase = np.array([], dtype=float)
     if not eis_frame.empty:
-        z_exp = eis_frame["re_ohm"] + eis_frame["rct_ohm"]
+        exp_mag = np.sqrt((eis_frame["re_ohm"] + eis_frame["rct_ohm"]) ** 2 + (eis_frame["rct_ohm"] / 2.0) ** 2).to_numpy(dtype=float)
+        exp_phase = -np.degrees(np.arctan2((eis_frame["rct_ohm"] / 2.0).to_numpy(dtype=float), (eis_frame["re_ohm"] + eis_frame["rct_ohm"]).to_numpy(dtype=float)))
         f_exp = np.geomspace(frequencies.min(), frequencies.max(), len(eis_frame))
-        bode.add_trace(go.Scatter(x=f_exp, y=z_exp, mode="markers", name="Experimental |Z|"), row=1, col=1)
-        bode.add_trace(go.Scatter(x=f_exp, y=np.zeros(len(eis_frame)), mode="markers", name="Experimental Phase"), row=2, col=1)
+        bode.add_trace(go.Scatter(x=f_exp, y=exp_mag, mode="markers", name="Experimental |Z|", marker=dict(color="#f2cc60", size=7)), row=1, col=1)
+        bode.add_trace(go.Scatter(x=f_exp, y=exp_phase, mode="markers", name="Experimental Phase", marker=dict(color="#ff7b72", size=7)), row=2, col=1)
     bode.update_xaxes(type="log", title_text="Frequency (Hz)", row=2, col=1)
     bode.update_yaxes(title_text="|Z| (Ohm)", row=1, col=1)
     bode.update_yaxes(title_text="Phase (deg)", row=2, col=1)
     bode.update_layout(title="Bode: Magnitude and Phase", height=520, hovermode="x unified")
 
-    if eis_frame.empty:
-        metrics = {"impedance_rmse": np.nan, "phase_error_deg": np.nan}
-    else:
-        z_exp = (eis_frame["re_ohm"] + eis_frame["rct_ohm"]).to_numpy(dtype=float)
-        model_mag = np.interp(np.linspace(0, 1, len(z_exp)), np.linspace(0, 1, len(z_model)), np.abs(z_model))
-        metrics = {
-            "impedance_rmse": float(np.sqrt(np.mean((model_mag - z_exp) ** 2))),
-            "phase_error_deg": float(np.mean(np.abs(np.angle(z_model, deg=True)))),
+    diagnostics = pd.DataFrame(
+        {
+            "frequency_hz": frequencies,
+            "re_z_ohm": z_real,
+            "im_z_ohm": z_imag,
+            "abs_z_ohm": z_mag,
+            "phase_deg": z_phase,
         }
-    return metrics, nyquist, bode
+    )
+
+    high_freq_intercept = float(z_real[-1])
+    low_freq_impedance = float(z_mag[0])
+    min_magnitude = float(np.nanmin(z_mag))
+    warnings = list(dict.fromkeys(param_warnings))
+    if min_magnitude < 0.01:
+        warnings.append("ECM |Z| collapsed below 0.01 Ohm; check resistance scaling and units.")
+    if clean_params["r0"] <= 0 or clean_params["r1"] <= 0 or clean_params["r2"] <= 0:
+        warnings.append("ECM resistance parameters must be positive.")
+    if not (low_freq_impedance > high_freq_intercept):
+        warnings.append("Low-frequency impedance is not above the high-frequency R0 intercept.")
+
+    insights = []
+    if eis_frame.empty:
+        metrics: dict[str, object] = {"impedance_rmse": np.nan, "phase_rmse_deg": np.nan}
+        insights.append("Experimental EIS points are unavailable for Bode RMSE.")
+    else:
+        f_exp = np.geomspace(frequencies.min(), frequencies.max(), len(exp_mag))
+        model_mag = np.interp(np.log10(f_exp), np.log10(frequencies), z_mag)
+        model_phase = np.interp(np.log10(f_exp), np.log10(frequencies), z_phase)
+        impedance_rmse = float(np.sqrt(np.mean((model_mag - exp_mag) ** 2)))
+        phase_rmse = float(np.sqrt(np.mean((model_phase - exp_phase) ** 2)))
+        metrics = {
+            "impedance_rmse": impedance_rmse,
+            "phase_rmse_deg": phase_rmse,
+            "phase_error_deg": phase_rmse,
+        }
+        exp_mean = float(np.nanmean(exp_mag))
+        if impedance_rmse <= max(0.015, 0.15 * exp_mean) and phase_rmse <= 12.0:
+            insights.append("Good frequency-domain agreement.")
+        if impedance_rmse > max(0.02, 0.25 * exp_mean):
+            insights.append("Magnitude mismatch detected.")
+        if float(np.nanmean(np.abs(model_phase))) > float(np.nanmean(np.abs(exp_phase))) + 10.0:
+            insights.append("Phase overestimation detected.")
+        if impedance_rmse > max(0.02, 0.20 * exp_mean) or phase_rmse > 15.0:
+            insights.append("Potential RC tuning issue.")
+
+    metrics.update(
+        {
+            "r0_ohm": clean_params["r0"],
+            "r1_ohm": clean_params["r1"],
+            "r2_ohm": clean_params["r2"],
+            "c1_f": clean_params["c1"],
+            "c2_f": clean_params["c2"],
+            "tau1_s": clean_params["r1"] * clean_params["c1"],
+            "tau2_s": clean_params["r2"] * clean_params["c2"],
+            "high_freq_intercept_ohm": high_freq_intercept,
+            "low_freq_impedance_ohm": low_freq_impedance,
+            "min_magnitude_ohm": min_magnitude,
+            "warnings": warnings,
+            "insights": insights,
+        }
+    )
+    return metrics, nyquist, bode, diagnostics
 
 
 def add_physics_features(
@@ -1512,12 +1653,46 @@ def main() -> None:
         val_cols[3].metric("Drift", format_kpi_value(r0_val.get("drift_percent"), suffix=" %", digits=2))
         val_cols[4].metric("Res Growth", format_kpi_value(imp_met.get("growth_rate"), suffix=" Ω/cyc", digits=6))
 
-        imp_validation, nyquist_fig, bode_fig = build_impedance_validation(detail_cycle_shadow, selected_ecm_params)
-        imp_cols = st.columns(2)
+        imp_validation, nyquist_fig, bode_fig, bode_diagnostics = build_impedance_validation(detail_cycle_shadow, selected_ecm_params)
+        imp_cols = st.columns(4)
         imp_cols[0].metric("Impedance RMSE", format_kpi_value(imp_validation.get("impedance_rmse"), suffix=" Ω", digits=4))
-        imp_cols[1].metric("Phase Error", format_kpi_value(imp_validation.get("phase_error_deg"), suffix=" deg", digits=2))
+        imp_cols[1].metric("Phase RMSE", format_kpi_value(imp_validation.get("phase_rmse_deg"), suffix=" deg", digits=2))
+        imp_cols[2].metric("High-f R0", format_kpi_value(imp_validation.get("high_freq_intercept_ohm"), suffix=" Ω", digits=4))
+        imp_cols[3].metric("Low-f |Z|", format_kpi_value(imp_validation.get("low_freq_impedance_ohm"), suffix=" Ω", digits=4))
+
+        warnings = imp_validation.get("warnings", [])
+        if isinstance(warnings, list) and warnings:
+            st.warning(" ".join(str(item) for item in warnings))
+
+        insights = imp_validation.get("insights", [])
+        if isinstance(insights, list) and insights:
+            st.info(" ".join(str(item) for item in insights))
+
         st.plotly_chart(nyquist_fig, use_container_width=True)
         st.plotly_chart(bode_fig, use_container_width=True)
+
+        with st.expander("Bode ECM Diagnostics", expanded=False):
+            param_cols = st.columns(4)
+            param_cols[0].metric("R0", format_kpi_value(imp_validation.get("r0_ohm"), suffix=" Ω", digits=5))
+            param_cols[0].metric("R1", format_kpi_value(imp_validation.get("r1_ohm"), suffix=" Ω", digits=5))
+            param_cols[1].metric("R2", format_kpi_value(imp_validation.get("r2_ohm"), suffix=" Ω", digits=5))
+            param_cols[1].metric("Min |Z|", format_kpi_value(imp_validation.get("min_magnitude_ohm"), suffix=" Ω", digits=5))
+            param_cols[2].metric("C1", format_kpi_value(imp_validation.get("c1_f"), suffix=" F", digits=1))
+            param_cols[2].metric("C2", format_kpi_value(imp_validation.get("c2_f"), suffix=" F", digits=1))
+            param_cols[3].metric("Tau1", format_kpi_value(imp_validation.get("tau1_s"), suffix=" s", digits=3))
+            param_cols[3].metric("Tau2", format_kpi_value(imp_validation.get("tau2_s"), suffix=" s", digits=3))
+            st.dataframe(
+                bode_diagnostics.iloc[:: max(1, len(bode_diagnostics) // 24)].round(
+                    {
+                        "frequency_hz": 4,
+                        "re_z_ohm": 6,
+                        "im_z_ohm": 6,
+                        "abs_z_ohm": 6,
+                        "phase_deg": 3,
+                    }
+                ),
+                use_container_width=True,
+            )
         
         if not imp_trend_batt.empty:
             st.markdown("#### Resistance Growth Trend")
