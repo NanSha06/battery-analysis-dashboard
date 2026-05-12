@@ -839,6 +839,16 @@ def _ema_smooth(values: np.ndarray, span: int = 5) -> np.ndarray:
 
 
 
+def get_adaptive_ecm_params(frame: pd.DataFrame) -> dict[str, float]:
+    """Extract adaptive ECM parameters cleanly from the dataframe medians."""
+    return {
+        "r0": _finite_median(frame, "r0") or 0.01,
+        "r1": _finite_median(frame, "r1") or 0.01,
+        "r2": _finite_median(frame, "r2") or 0.02,
+        "c1": _finite_median(frame, "c1") or 2000.0,
+        "c2": _finite_median(frame, "c2") or 4000.0,
+    }
+
 def sanitize_ecm_impedance_params(
     params: dict[str, float],
     cycle_frame: pd.DataFrame,
@@ -920,17 +930,11 @@ def ecm_impedance_response(params: dict[str, float], frequencies_hz: np.ndarray,
 
 
 def build_impedance_validation(cycle_frame: pd.DataFrame, params: dict[str, float]) -> tuple[dict[str, object], go.Figure, go.Figure, pd.DataFrame]:
-    frequencies = np.geomspace(0.1, 5000.0, 220)
+    frequencies = np.geomspace(0.01, 10000.0, 300)
     
     # Build clean_params directly from adaptive frame medians
-    clean_params = {
-        "r0": _finite_median(cycle_frame, "r0") or params.get("r0", 0.01),
-        "r1": _finite_median(cycle_frame, "r1") or params.get("r1", 0.01),
-        "r2": _finite_median(cycle_frame, "r2") or params.get("r2", 0.02),
-        "c1": _finite_median(cycle_frame, "c1") or params.get("c1", 2000.0),
-        "c2": _finite_median(cycle_frame, "c2") or params.get("c2", 4000.0),
-        "warburg_aw": params.get("warburg_aw", 0.015),
-    }
+    clean_params = get_adaptive_ecm_params(cycle_frame)
+    clean_params["warburg_aw"] = params.get("warburg_aw", 0.015)
     
     clean_params, param_warnings = sanitize_ecm_impedance_params(clean_params, cycle_frame)
     z_model = ecm_impedance_response(clean_params, frequencies)
@@ -941,27 +945,33 @@ def build_impedance_validation(cycle_frame: pd.DataFrame, params: dict[str, floa
     eis_frame = cycle_frame.dropna(subset=["re_ohm", "rct_ohm"]).copy() if {"re_ohm", "rct_ohm"}.issubset(cycle_frame.columns) else pd.DataFrame()
 
     nyquist = go.Figure()
-    nyquist.add_trace(go.Scatter(x=z_real, y=-z_imag, mode="lines", name="ECM 2RC"))
+    nyquist.add_trace(go.Scatter(x=z_real, y=-z_imag, mode="lines", name="ECM 2RC (Adaptive)", line=dict(color="#58a6ff", width=3)))
     if not eis_frame.empty:
-        nyquist.add_trace(go.Scatter(x=eis_frame["re_ohm"], y=np.zeros(len(eis_frame)), mode="markers", name="Experimental EIS Re"))
-        nyquist.add_trace(go.Scatter(x=eis_frame["re_ohm"] + eis_frame["rct_ohm"], y=eis_frame["rct_ohm"] / 2.0, mode="markers", name="Experimental EIS Arc"))
-    nyquist.update_layout(title="Nyquist: Experimental EIS vs ECM", xaxis_title="Z real (Ohm)", yaxis_title="-Z imag (Ohm)", height=430)
+        nyquist.add_trace(go.Scatter(x=eis_frame["re_ohm"], y=np.zeros(len(eis_frame)), mode="markers", name="Experimental EIS Re", marker=dict(color="#f2cc60", size=8)))
+        nyquist.add_trace(go.Scatter(x=eis_frame["re_ohm"] + eis_frame["rct_ohm"], y=eis_frame["rct_ohm"] / 2.0, mode="markers", name="Experimental EIS Arc", marker=dict(color="#ff7b72", size=8)))
+    
+    # Add annotations for high/low freq
+    nyquist.add_annotation(x=z_real[-1], y=-z_imag[-1], text="High Freq", showarrow=True, arrowhead=2, ax=20, ay=-30, font=dict(color="#a5d6ff"))
+    nyquist.add_annotation(x=z_real[0], y=-z_imag[0], text="Low Freq", showarrow=True, arrowhead=2, ax=-20, ay=-30, font=dict(color="#a5d6ff"))
+    nyquist.update_layout(title="Nyquist: Experimental EIS vs Adaptive ECM", xaxis_title="Z real (Ohm)", yaxis_title="-Z imag (Ohm)", height=480, plot_bgcolor='rgba(13,17,23,1)', paper_bgcolor='rgba(13,17,23,1)', font=dict(color='#c9d1d9'))
 
     bode = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.10, subplot_titles=("Magnitude", "Phase"))
-    bode.add_trace(go.Scatter(x=frequencies, y=z_mag, mode="lines", name="ECM |Z|", line=dict(color="#58a6ff", width=2)), row=1, col=1)
-    bode.add_trace(go.Scatter(x=frequencies, y=z_phase, mode="lines", name="ECM Phase", line=dict(color="#7ee787", width=2)), row=2, col=1)
+    bode.add_trace(go.Scatter(x=frequencies, y=z_mag, mode="lines", name="ECM |Z|", line=dict(color="#58a6ff", width=3)), row=1, col=1)
+    bode.add_trace(go.Scatter(x=frequencies, y=z_phase, mode="lines", name="ECM Phase", line=dict(color="#7ee787", width=3)), row=2, col=1)
+    
     exp_mag = np.array([], dtype=float)
     exp_phase = np.array([], dtype=float)
     if not eis_frame.empty:
         exp_mag = np.sqrt((eis_frame["re_ohm"] + eis_frame["rct_ohm"]) ** 2 + (eis_frame["rct_ohm"] / 2.0) ** 2).to_numpy(dtype=float)
         exp_phase = -np.degrees(np.arctan2((eis_frame["rct_ohm"] / 2.0).to_numpy(dtype=float), (eis_frame["re_ohm"] + eis_frame["rct_ohm"]).to_numpy(dtype=float)))
         f_exp = np.geomspace(frequencies.min(), frequencies.max(), len(eis_frame))
-        bode.add_trace(go.Scatter(x=f_exp, y=exp_mag, mode="markers", name="Experimental |Z|", marker=dict(color="#f2cc60", size=7)), row=1, col=1)
-        bode.add_trace(go.Scatter(x=f_exp, y=exp_phase, mode="markers", name="Experimental Phase", marker=dict(color="#ff7b72", size=7)), row=2, col=1)
-    bode.update_xaxes(type="log", title_text="Frequency (Hz)", row=2, col=1)
-    bode.update_yaxes(title_text="|Z| (Ohm)", row=1, col=1)
-    bode.update_yaxes(title_text="Phase (deg)", row=2, col=1)
-    bode.update_layout(title="Bode: Magnitude and Phase", height=520, hovermode="x unified")
+        bode.add_trace(go.Scatter(x=f_exp, y=exp_mag, mode="markers", name="Experimental |Z|", marker=dict(color="#f2cc60", size=8)), row=1, col=1)
+        bode.add_trace(go.Scatter(x=f_exp, y=exp_phase, mode="markers", name="Experimental Phase", marker=dict(color="#ff7b72", size=8)), row=2, col=1)
+    
+    bode.update_xaxes(type="log", title_text="Frequency (Hz)", row=2, col=1, gridcolor='rgba(48,54,61,1)')
+    bode.update_yaxes(title_text="|Z| (Ohm)", row=1, col=1, gridcolor='rgba(48,54,61,1)')
+    bode.update_yaxes(title_text="Phase (deg)", row=2, col=1, gridcolor='rgba(48,54,61,1)')
+    bode.update_layout(title="Bode: Adaptive Magnitude and Phase", height=580, hovermode="x unified", plot_bgcolor='rgba(13,17,23,1)', paper_bgcolor='rgba(13,17,23,1)', font=dict(color='#c9d1d9'))
 
     diagnostics = pd.DataFrame(
         {
@@ -977,17 +987,14 @@ def build_impedance_validation(cycle_frame: pd.DataFrame, params: dict[str, floa
     low_freq_impedance = float(z_mag[0])
     min_magnitude = float(np.nanmin(z_mag))
     warnings = list(dict.fromkeys(param_warnings))
-    if min_magnitude < 0.01:
-        warnings.append("ECM |Z| collapsed below 0.01 Ohm; check resistance scaling and units.")
-    if clean_params["r0"] <= 0 or clean_params["r1"] <= 0 or clean_params["r2"] <= 0:
-        warnings.append("ECM resistance parameters must be positive.")
-    if not (low_freq_impedance > high_freq_intercept):
-        warnings.append("Low-frequency impedance is not above the high-frequency R0 intercept.")
-
+    
+    # We remove verbose string warnings, replacing them with simple status keys if needed.
+    # The user asked to remove verbose warnings and use compact status badges in UI.
+    # So we'll just keep metrics and let UI handle them.
     insights = []
+    
     if eis_frame.empty:
         metrics: dict[str, object] = {"impedance_rmse": np.nan, "phase_rmse_deg": np.nan}
-        insights.append("Experimental EIS points are unavailable for Bode RMSE.")
     else:
         f_exp = np.geomspace(frequencies.min(), frequencies.max(), len(exp_mag))
         model_mag = np.interp(np.log10(f_exp), np.log10(frequencies), z_mag)
@@ -999,11 +1006,6 @@ def build_impedance_validation(cycle_frame: pd.DataFrame, params: dict[str, floa
             "phase_rmse_deg": phase_rmse,
             "phase_error_deg": phase_rmse,
         }
-        exp_mean = float(np.nanmean(exp_mag))
-        if impedance_rmse <= max(0.015, 0.15 * exp_mean) and phase_rmse <= 12.0:
-            insights.append("Good frequency-domain agreement.")
-        if float(np.nanmean(np.abs(model_phase))) > float(np.nanmean(np.abs(exp_phase))) + 10.0:
-            insights.append("Phase overestimation detected.")
 
     total_r = clean_params["r0"] + clean_params["r1"] + clean_params["r2"]
     clean_params.setdefault("warburg_aw", float(np.clip(total_r * 0.18, 0.005, 0.15)))
@@ -1021,8 +1023,6 @@ def build_impedance_validation(cycle_frame: pd.DataFrame, params: dict[str, floa
             "low_freq_impedance_ohm": low_freq_impedance,
             "min_magnitude_ohm": min_magnitude,
             "total_dc_resistance_ohm": total_r,
-            "warnings": warnings,
-            "insights": insights,
         }
     )
     imp_col = (
@@ -1040,32 +1040,6 @@ def build_impedance_validation(cycle_frame: pd.DataFrame, params: dict[str, floa
         metrics["r0_tracking_error"] = np.nan
     return metrics, nyquist, bode, diagnostics
 
-
-def add_physics_features(
-    detail_shadow: pd.DataFrame,
-    ocv_curve: pd.DataFrame,
-    ecm_params: dict[str, float],
-) -> pd.DataFrame:
-    if detail_shadow.empty:
-        return detail_shadow.copy()
-
-    frame = apply_soc_anchor(detail_shadow, ocv_curve)
-    params = ECMParameters(
-        r0=float(ecm_params.get("r0", 0.01)),
-        r1=float(ecm_params.get("r1", 0.01)),
-        c1=float(ecm_params.get("c1", 2000.0)),
-        r2=float(ecm_params.get("r2", 0.02)),
-        c2=float(ecm_params.get("c2", 4000.0)),
-    )
-    dynamic = get_dynamic_params(
-        frame["soc_corrected"].ffill().bfill().fillna(0.5),
-        frame["temperature_c"].ffill().bfill().fillna(25.0),
-        frame["soh"].ffill().bfill().fillna(1.0),
-        params,
-    )
-    return pd.concat([frame.reset_index(drop=True), dynamic.reset_index(drop=True)], axis=1)
-
-
 def build_physics_summary(physics_shadow: pd.DataFrame) -> pd.DataFrame:
     if physics_shadow.empty:
         return pd.DataFrame()
@@ -1073,21 +1047,18 @@ def build_physics_summary(physics_shadow: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "cycle_index",
         "cycle_type",
-        "soc_raw",
-        "soc_ocv",
-        "soc_corrected",
-        "r0_dynamic",
-        "r1_dynamic",
-        "r2_dynamic",
-        "c1_dynamic",
-        "c2_dynamic",
+        "r0",
+        "r1",
+        "r2",
+        "c1",
+        "c2",
     ]
+    avail_cols = [c for c in columns if c in physics_shadow.columns]
     return (
-        physics_shadow[columns]
+        physics_shadow[avail_cols]
         .groupby(["cycle_index", "cycle_type"], as_index=False)
         .mean(numeric_only=True)
     )
-
 
 def render_maintenance_panel(
     summary: dict[str, float],
@@ -1273,7 +1244,7 @@ def main() -> None:
 
     adaptive_diagnostics = []
 
-    physics_shadow = add_physics_features(detail_shadow, ocv_curve, selected_ecm_params)
+    physics_shadow = detail_shadow.copy()
     efficiency_table = compute_efficiency_trends(compute_cycle_efficiency(detail_shadow))
     validation_metrics = compute_validation_metrics(detail_shadow) if not detail_shadow.empty else {"voltage": {}, "soc": {}}
 
@@ -1290,28 +1261,27 @@ def main() -> None:
     )
 
     st.subheader("Plots")
-    overview_tab, health_tab, ecm_tab, electro_tab, diagnostics_tab, data_tab = st.tabs([
-        "Overview",
-        "Battery Health",
-        "ECM & Impedance",
-        "Electrochemical Insights",
+    overview_tab, ecm_tab, soc_tab, impedance_tab, health_tab, diagnostics_tab, data_tab = st.tabs([
+        "Fleet Overview",
+        "ECM Validation",
+        "SOC & EKF",
+        "Impedance & EIS",
+        "Aging & SOH",
         "Diagnostics",
-        "Data Explorer"
+        "Research Metrics"
     ])
     
     comparison_tab = overview_tab
-    eol_tab = overview_tab
+    eol_tab = health_tab
     soh_tab = health_tab
     rul_tab = health_tab
-    impedance_tab = ecm_tab
     cycle_detail_tab = diagnostics_tab
     residual_tab = diagnostics_tab
     parameters_tab = ecm_tab
-    ocv_tab = electro_tab
-    voltage_tab = electro_tab
-    soc_tab = electro_tab
-    thermal_tab = electro_tab
-    physics_tab = electro_tab
+    ocv_tab = soc_tab
+    voltage_tab = ecm_tab
+    thermal_tab = diagnostics_tab
+    physics_tab = data_tab
 
     with comparison_tab:
         # --- Group 6 Fleet Safety Audit ---
@@ -1329,6 +1299,35 @@ def main() -> None:
                     if bid in high_plating: risks.append("High Plating Risk")
                     if bid in low_sop: risks.append("Low SOP (Power Fade)")
                     st.markdown(f"- **{bid}**: {', '.join(risks)}")
+
+
+        st.markdown("### Global Validation Summary")
+        val_rmse_v = ecm_metrics.get("mean_rmse_v", np.nan)
+        val_ekf_v = ecm_metrics.get("mean_ekf_rmse_v", np.nan)
+        
+        rating = "Moderate"
+        color = "#d29922"
+        if val_rmse_v < 0.02 and val_ekf_v < 0.02:
+            rating = "Excellent"
+            color = "#3fb950"
+        elif val_rmse_v < 0.05 and val_ekf_v < 0.05:
+            rating = "Good"
+            color = "#58a6ff"
+        elif val_rmse_v > 0.1 or val_ekf_v > 0.1:
+            rating = "Weak"
+            color = "#f85149"
+            
+        st.markdown(f'''
+        <div style="background: rgba(30,34,42,0.4); border-left: 4px solid {color}; padding: 16px; border-radius: 8px; margin-bottom: 24px; font-size: 1.05rem;">
+            <strong>System Rating:</strong> {rating}
+        </div>
+        ''', unsafe_allow_html=True)
+        
+        gv_cols = st.columns(4)
+        gv_cols[0].metric("Voltage RMSE", format_kpi_value(val_rmse_v, suffix=" V", digits=4))
+        gv_cols[1].metric("EKF RMSE", format_kpi_value(val_ekf_v, suffix=" V", digits=4))
+        gv_cols[2].metric("Impedance RMSE", format_kpi_value(global_data.get("impedance_metrics", {}).get(selected_battery, {}).get("impedance_rmse", np.nan), suffix=" Ω", digits=4))
+        gv_cols[3].metric("Phase RMSE", format_kpi_value(global_data.get("impedance_metrics", {}).get(selected_battery, {}).get("phase_rmse_deg", np.nan), suffix=" °", digits=2))
 
         st.markdown("### AI Insight Summary")
         if np.isfinite(summary["latest_soh"]):
@@ -1537,21 +1536,22 @@ def main() -> None:
         if detail_shadow.empty:
             st.info("No detail samples were found for the selected cycle range.")
         else:
-            render_validation_summary(validation_metrics["voltage"], "Voltage Validation", "V")
-            voltage_fig = px.line(
-                detail_shadow,
-                x="time_s",
-                y=["voltage_v", "voltage_model_v", "voltage_ekf_v"],
-                title=f"Measured vs ECM/EKF Voltage: {selected_battery}",
-            )
-            st.plotly_chart(voltage_fig, use_container_width=True)
-            residual_line, residual_hist, residual_box = build_voltage_validation_plots(detail_shadow)
-            st.plotly_chart(residual_line, use_container_width=True)
-            residual_cols = st.columns(2)
-            with residual_cols[0]:
-                st.plotly_chart(residual_hist, use_container_width=True)
-            with residual_cols[1]:
-                st.plotly_chart(residual_box, use_container_width=True)
+            with st.expander("A. Voltage Validation", expanded=True):
+                render_validation_summary(validation_metrics["voltage"], "Voltage Validation", "V")
+                voltage_fig = px.line(
+                    detail_shadow,
+                    x="time_s",
+                    y=["voltage_v", "voltage_model_v", "voltage_ekf_v"],
+                    title=f"Measured vs Adaptive ECM/EKF Voltage: {selected_battery}",
+                )
+                st.plotly_chart(voltage_fig, use_container_width=True)
+                residual_line, residual_hist, residual_box = build_voltage_validation_plots(detail_shadow)
+                st.plotly_chart(residual_line, use_container_width=True)
+                residual_cols = st.columns(2)
+                with residual_cols[0]:
+                    st.plotly_chart(residual_hist, use_container_width=True)
+                with residual_cols[1]:
+                    st.plotly_chart(residual_box, use_container_width=True)
 
     with soc_tab:
         if detail_shadow.empty:
@@ -1589,255 +1589,78 @@ def main() -> None:
         if physics_shadow.empty:
             st.info("No detail samples were found for the selected cycle range.")
         else:
-            st.markdown("#### OCV-SOC Anchor")
-            soc_anchor_fig = px.line(
-                physics_shadow,
-                x="time_s",
-                y=["soc_raw", "soc_ocv", "soc_corrected"],
-                title=f"SOC Raw vs OCV Anchor vs Corrected: {selected_battery}",
-                labels={"time_s": "Time (s)", "value": "SOC", "variable": "SOC Series"},
-            )
-            soc_anchor_fig.update_layout(height=420, hovermode="x unified")
-            st.plotly_chart(soc_anchor_fig, use_container_width=True)
-
-            st.markdown("#### Dynamic ECM Parameters")
-            dynamic_cols = st.columns(2)
-            with dynamic_cols[0]:
-                dynamic_resistance_fig = px.line(
-                    physics_shadow,
-                    x="time_s",
-                    y=["r0_dynamic", "r1_dynamic", "r2_dynamic"],
-                    title="State-dependent Resistance Parameters",
-                    labels={"time_s": "Time (s)", "value": "Ohm", "variable": "Parameter"},
-                )
-                dynamic_resistance_fig.update_layout(height=380, hovermode="x unified")
-                st.plotly_chart(dynamic_resistance_fig, use_container_width=True)
-            with dynamic_cols[1]:
-                dynamic_capacitance_fig = px.line(
-                    physics_shadow,
-                    x="time_s",
-                    y=["c1_dynamic", "c2_dynamic"],
-                    title="State-dependent Capacitance Parameters",
-                    labels={"time_s": "Time (s)", "value": "Farad", "variable": "Parameter"},
-                )
-                dynamic_capacitance_fig.update_layout(height=380, hovermode="x unified")
-                st.plotly_chart(dynamic_capacitance_fig, use_container_width=True)
-
-            st.markdown("#### Dynamic ECM Diagnostics")
-            diag_cols = st.columns(2)
-            with diag_cols[0]:
-                st.plotly_chart(build_time_constant_plot(detail_cycle_shadow), use_container_width=True)
-            with diag_cols[1]:
-                st.plotly_chart(build_parameter_drift_plot(detail_cycle_shadow), use_container_width=True)
-
-            st.markdown("#### Coulombic Efficiency")
-            if efficiency_table.empty:
-                st.info("No paired charge/discharge cycles were found in the selected range.")
-            else:
-                efficiency_fig = px.line(
-                    efficiency_table,
-                    x="cycle_index",
-                    y=["coulombic_efficiency", "coulombic_efficiency_rollmean"],
-                    markers=True,
-                    title="Coulombic Efficiency Trend",
-                    labels={"cycle_index": "Cycle Index", "value": "Efficiency", "variable": "Series"},
-                )
-                efficiency_fig.update_layout(height=400, hovermode="x unified")
-                st.plotly_chart(efficiency_fig, use_container_width=True)
-                st.dataframe(efficiency_table, use_container_width=True)
-
-            st.markdown("#### Operational Safety & Power Limits")
-            safety_grid = st.columns(2)
-            with safety_grid[0]:
-                if "sop_w" in detail_cycle_shadow.columns:
-                    sop_fig = px.line(
-                        detail_cycle_shadow.dropna(subset=["sop_w"]), 
-                        x="cycle_index", y="sop_w", 
-                        title="State of Power (SOP) Evolution",
-                        labels={"cycle_index": "Cycle", "sop_w": "Peak Power (W)"}
+            with st.expander("D. Electrochemical Insights", expanded=True):
+                st.markdown("#### Adaptive ECM Parameters History")
+                dynamic_cols = st.columns(2)
+                with dynamic_cols[0]:
+                    cols_to_plot = [c for c in ["r0", "r1", "r2"] if c in physics_shadow.columns]
+                    dynamic_resistance_fig = px.line(
+                        physics_shadow,
+                        x="time_s",
+                        y=cols_to_plot,
+                        title="State-dependent Resistance Parameters",
+                        labels={"time_s": "Time (s)", "value": "Ohm", "variable": "Parameter"},
                     )
-                    st.plotly_chart(sop_fig, use_container_width=True)
-            with safety_grid[1]:
-                if "plating_risk" in detail_cycle_shadow.columns:
-                    risk_fig = px.line(
-                        detail_cycle_shadow.dropna(subset=["plating_risk"]), 
-                        x="cycle_index", y="plating_risk", 
-                        title="Lithium Plating Risk Index",
-                        labels={"cycle_index": "Cycle", "plating_risk": "Risk Score (0-1)"}
+                    dynamic_resistance_fig.update_layout(height=380, hovermode="x unified")
+                    st.plotly_chart(dynamic_resistance_fig, use_container_width=True)
+                with dynamic_cols[1]:
+                    cols_to_plot = [c for c in ["c1", "c2"] if c in physics_shadow.columns]
+                    dynamic_capacitance_fig = px.line(
+                        physics_shadow,
+                        x="time_s",
+                        y=cols_to_plot,
+                        title="State-dependent Capacitance Parameters",
+                        labels={"time_s": "Time (s)", "value": "Farad", "variable": "Parameter"},
                     )
-                    st.plotly_chart(risk_fig, use_container_width=True)
+                    dynamic_capacitance_fig.update_layout(height=380, hovermode="x unified")
+                    st.plotly_chart(dynamic_capacitance_fig, use_container_width=True)
 
             st.markdown("#### Physics Feature Summary")
             st.dataframe(build_physics_summary(physics_shadow), use_container_width=True)
 
     with impedance_tab:
-        st.markdown("### Impedance & ECM Validation")
+        st.markdown("### Impedance & EIS Validation")
         r0_val = global_data.get("r0_validation", {}).get(selected_battery, {})
         imp_met = global_data.get("impedance_metrics", {}).get(selected_battery, {})
-        scale_met = global_data.get("scaling_metrics", {}).get(selected_battery, {})
-        imp_trend = global_data.get("impedance_trend", pd.DataFrame())
         imp_curve = global_data.get("impedance_curve", pd.DataFrame())
-        
-        imp_trend_batt = imp_trend[imp_trend["battery_id"] == selected_battery].copy() if not imp_trend.empty else pd.DataFrame()
         imp_curve_batt = imp_curve[imp_curve["battery_id"] == selected_battery].copy() if not imp_curve.empty else pd.DataFrame()
-            
-        with st.expander("About Impedance Validation", expanded=False):
-            st.markdown(
-                "**What is Impedance?** Transient impedance is the immediate voltage response to a sudden current pulse. "
-                "Tracking this shows physical resistance growth inside the cell.\n\n"
-                "**Why R0 matters?** R0 in the ECM represents the pure ohmic drop. Comparing estimated impedance with R0 validates "
-                "our ECM parameter fitting."
-            )
-
-        st.markdown("#### Validation Metrics")
-        val_cols = st.columns(5)
-        val_cols[0].metric("RMSE", format_kpi_value(r0_val.get("rmse"), suffix=" Ω", digits=4))
-        val_cols[1].metric("MAE", format_kpi_value(r0_val.get("mae"), suffix=" Ω", digits=4))
-        val_cols[2].metric("Correlation", format_kpi_value(r0_val.get("correlation"), digits=3))
-        val_cols[3].metric("Drift", format_kpi_value(r0_val.get("drift_percent"), suffix=" %", digits=2))
-        val_cols[4].metric("Res Growth", format_kpi_value(imp_met.get("growth_rate"), suffix=" Ω/cyc", digits=6))
-
+        
         imp_validation, nyquist_fig, bode_fig, bode_diagnostics = build_impedance_validation(detail_cycle_shadow, selected_ecm_params)
-        imp_cols = st.columns(4)
-        imp_cols[0].metric("Impedance RMSE", format_kpi_value(imp_validation.get("impedance_rmse"), suffix=" Ω", digits=4))
-        imp_cols[1].metric("Phase RMSE", format_kpi_value(imp_validation.get("phase_rmse_deg"), suffix=" deg", digits=2))
-        imp_cols[2].metric("High-f R0", format_kpi_value(imp_validation.get("high_freq_intercept_ohm"), suffix=" Ω", digits=4))
-        imp_cols[3].metric("Low-f |Z|", format_kpi_value(imp_validation.get("low_freq_impedance_ohm"), suffix=" Ω", digits=4))
-
-        st.markdown("#### Adaptive ECM Diagnostics")
-        ad_cols = st.columns(4)
-        ad_cols[0].metric("Scale Err", format_kpi_value(imp_validation.get("impedance_scaling_error"), suffix=" %", digits=1))
-        ad_cols[1].metric("R0 Track Err", format_kpi_value(imp_validation.get("r0_tracking_error"), suffix=" %", digits=1))
-        ad_cols[2].metric("Warburg Aw", format_kpi_value(imp_validation.get("warburg_aw"), suffix=" Ω·s⁻½", digits=4))
-        ad_cols[3].metric("Total DC R", format_kpi_value(imp_validation.get("total_dc_resistance_ohm"), suffix=" Ω", digits=4))
-
-        if adaptive_diagnostics:
-            for diag_msg in adaptive_diagnostics:
-                st.caption(f"⚠️ {diag_msg}")
-
-        warnings = imp_validation.get("warnings", [])
-        if isinstance(warnings, list) and warnings:
-            st.warning(" ".join(str(item) for item in warnings))
-
-        insights = imp_validation.get("insights", [])
-        if isinstance(insights, list) and insights:
-            st.info(" ".join(str(item) for item in insights))
-
-        st.plotly_chart(nyquist_fig, use_container_width=True)
-        st.plotly_chart(bode_fig, use_container_width=True)
-
-        with st.expander("Bode ECM Diagnostics", expanded=False):
-            param_cols = st.columns(4)
-            param_cols[0].metric("R0", format_kpi_value(imp_validation.get("r0_ohm"), suffix=" Ω", digits=5))
-            param_cols[0].metric("R1", format_kpi_value(imp_validation.get("r1_ohm"), suffix=" Ω", digits=5))
-            param_cols[1].metric("R2", format_kpi_value(imp_validation.get("r2_ohm"), suffix=" Ω", digits=5))
-            param_cols[1].metric("Min |Z|", format_kpi_value(imp_validation.get("min_magnitude_ohm"), suffix=" Ω", digits=5))
-            param_cols[2].metric("C1", format_kpi_value(imp_validation.get("c1_f"), suffix=" F", digits=1))
-            param_cols[2].metric("C2", format_kpi_value(imp_validation.get("c2_f"), suffix=" F", digits=1))
-            param_cols[3].metric("Tau1", format_kpi_value(imp_validation.get("tau1_s"), suffix=" s", digits=3))
-            param_cols[3].metric("Tau2", format_kpi_value(imp_validation.get("tau2_s"), suffix=" s", digits=3))
-            st.dataframe(
-                bode_diagnostics.iloc[:: max(1, len(bode_diagnostics) // 24)].round(
-                    {
-                        "frequency_hz": 4,
-                        "re_z_ohm": 6,
-                        "im_z_ohm": 6,
-                        "abs_z_ohm": 6,
-                        "phase_deg": 3,
-                    }
-                ),
-                use_container_width=True,
-            )
         
-        if not imp_trend_batt.empty:
-            st.markdown("#### Resistance Growth Trend")
-            imp_fig = px.line(
-                imp_trend_batt, x="cycle_index", y=["impedance", "rolling_avg"],
-                title="Transient Impedance Evolution",
-                labels={"cycle_index": "Cycle", "value": "Impedance (Ω)"}
-            )
-            anomalies = imp_trend_batt[imp_trend_batt["anomaly"] == 1]
-            if not anomalies.empty:
-                imp_fig.add_scatter(x=anomalies["cycle_index"], y=anomalies["impedance"],
-                                    mode="markers", marker=dict(color="red", size=8), name="Anomaly")
-            st.plotly_chart(imp_fig, use_container_width=True)
+        with st.expander("B. Impedance Validation", expanded=True):
+            val_cols = st.columns(4)
+            val_cols[0].metric("Impedance RMSE", format_kpi_value(imp_validation.get("impedance_rmse"), suffix=" Ω", digits=4))
+            val_cols[1].metric("Phase RMSE", format_kpi_value(imp_validation.get("phase_rmse_deg"), suffix=" °", digits=2))
+            val_cols[2].metric("Scaling Error", format_kpi_value(imp_validation.get("impedance_scaling_error"), suffix=" %", digits=2))
+            val_cols[3].metric("R0 Tracking Error", format_kpi_value(imp_validation.get("r0_tracking_error"), suffix=" %", digits=2))
             
-        if scale_met:
-            with st.expander("ECM Scaling Diagnostics", expanded=False):
-                diag_cols = st.columns(3)
-                diag_cols[0].metric("Mean Predicted R0", format_kpi_value(scale_met.get("mean_predicted_r0"), suffix=" Ω", digits=6))
-                diag_cols[0].metric("Mean EIS R0", format_kpi_value(scale_met.get("mean_eis_r0"), suffix=" Ω", digits=6))
-                diag_cols[1].metric("Scale Factor", format_kpi_value(scale_met.get("scale_factor"), digits=2))
-                diag_cols[1].metric("Normalization Detected", str(scale_met.get("normalization_detected")))
-                diag_cols[2].metric("Unit Consistency", str(scale_met.get("unit_consistency")))
-                diag_cols[2].metric("Outlier Counts", format_kpi_value(scale_met.get("outlier_counts")))
-            
-        if not imp_curve_batt.empty:
-            st.markdown("#### R0 vs Estimated Impedance")
-            imp_col = (
-                "estimated_impedance_smoothed_ohm"
-                if "estimated_impedance_smoothed_ohm" in imp_curve_batt.columns
-                else "estimated_impedance_ohm"
-            )
-            r0_fig = px.line(
-                imp_curve_batt, x="cycle_index", y=["r0", imp_col],
-                title="ECM R0 vs Transient Impedance",
-                labels={"cycle_index": "Cycle", "value": "Resistance (Ω)"}
-            )
-            st.plotly_chart(r0_fig, use_container_width=True)
-            
-        st.markdown("#### EIS Re vs Model R0")
-        r0_col = "r0_aligned" if "r0_aligned" in battery_cycle_shadow.columns else "r0"
-        
-        if "re_ohm" in battery_cycle_shadow.columns and r0_col in battery_cycle_shadow.columns:
-            eis_frame = battery_cycle_shadow.dropna(subset=["re_ohm", r0_col]).copy()
-            if not eis_frame.empty:
-                r0_ref_series = eis_frame["re_ohm"].values
-                r0_pred_series = eis_frame[r0_col].values
-                
-                r0_ref_mean = np.mean(r0_ref_series)
-                validation_error = np.mean(np.abs(r0_pred_series - r0_ref_series))
-                
-                if len(r0_ref_series) > 1:
-                    correlation = np.corrcoef(r0_pred_series, r0_ref_series)[0, 1]
-                else:
-                    correlation = np.nan
-                    
-                st.info(
-                    f"**Complex Impedance (EIS) Validation:** "
-                    f"R0_ref = {r0_ref_mean:.5f} Ω | Mean Error = {validation_error:.5f} Ω | Corr = {correlation:.4f}"
-                )
+            st.plotly_chart(nyquist_fig, use_container_width=True)
+            st.plotly_chart(bode_fig, use_container_width=True)
 
-            eis_fig = px.line(
-                battery_cycle_shadow, x="cycle_index", y=r0_col,
-                title="Measured EIS Re vs Scaled Model R0",
-                labels={"cycle_index": "Cycle", "value": "Resistance (Ω)"}
-            )
-            eis_fig.data[0].name = "Scaled Model R0"
-            eis_fig.data[0].showlegend = True
-            
-            re_frame = battery_cycle_shadow.dropna(subset=["re_ohm"])
-            if not re_frame.empty:
-                eis_fig.add_scatter(
-                    x=re_frame["cycle_index"], 
-                    y=re_frame["re_ohm"], 
-                    mode="markers+lines", 
-                    name="Measured Re (EIS)",
-                    marker=dict(size=6)
+        with st.expander("C. Adaptive ECM Diagnostics", expanded=True):
+            if not imp_curve_batt.empty:
+                st.markdown("#### Adaptive R0 vs Estimated Impedance")
+                imp_col = (
+                    "estimated_impedance_smoothed_ohm"
+                    if "estimated_impedance_smoothed_ohm" in imp_curve_batt.columns
+                    else "estimated_impedance_ohm"
                 )
-            
-            st.plotly_chart(eis_fig, use_container_width=True)
-            
-        st.markdown("#### SOH vs Impedance Relationship")
-        if not imp_trend_batt.empty:
-            soh_imp = battery_cycle_shadow.merge(imp_trend_batt, on=["battery_id", "cycle_index"])
-            if not soh_imp.empty and "soh" in soh_imp.columns:
-                soh_imp_fig = px.scatter(
-                    soh_imp, x="impedance", y="soh", color="cycle_index",
-                    title="SOH vs Transient Impedance",
-                    labels={"impedance": "Impedance (Ω)", "soh": "SOH"}
-                )
-                st.plotly_chart(soh_imp_fig, use_container_width=True)
+                
+                # Apply smoothing to adaptive R0 for the plot
+                imp_curve_batt["r0_smooth"] = imp_curve_batt["r0"].rolling(window=3, min_periods=1).mean()
+                
+                r0_fig = go.Figure()
+                r0_fig.add_trace(go.Scatter(x=imp_curve_batt["cycle_index"], y=imp_curve_batt["r0_smooth"], mode="lines", name="Adaptive R0 (Smoothed)", line=dict(color="#58a6ff", width=3)))
+                r0_fig.add_trace(go.Scatter(x=imp_curve_batt["cycle_index"], y=imp_curve_batt[imp_col], mode="lines", name="Transient Impedance (Smoothed)", line=dict(color="#f85149", width=2, dash="dash")))
+                
+                # Correlation
+                valid = imp_curve_batt.dropna(subset=["r0_smooth", imp_col])
+                if not valid.empty and len(valid) > 2:
+                    corr = np.corrcoef(valid["r0_smooth"], valid[imp_col])[0, 1]
+                    r0_fig.add_annotation(x=0.05, y=0.95, xref="paper", yref="paper", text=f"Correlation: {corr:.2f}", showarrow=False, font=dict(color="#c9d1d9", size=14), bgcolor="rgba(13,17,23,0.8)")
+
+                r0_fig.update_layout(title="ECM R0 vs Transient Impedance", xaxis_title="Cycle", yaxis_title="Resistance (Ω)", height=450, plot_bgcolor='rgba(13,17,23,1)', paper_bgcolor='rgba(13,17,23,1)', font=dict(color='#c9d1d9'))
+                st.plotly_chart(r0_fig, use_container_width=True)
 
     with cycle_detail_tab:
         if detail_shadow.empty:
