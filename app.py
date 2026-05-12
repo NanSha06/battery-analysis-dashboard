@@ -838,83 +838,6 @@ def _ema_smooth(values: np.ndarray, span: int = 5) -> np.ndarray:
     return out
 
 
-def apply_adaptive_ecm_to_cycles(
-    cycle_frame: pd.DataFrame,
-    base_params: dict[str, float],
-) -> tuple[pd.DataFrame, dict[str, float], list[str]]:
-    """Overwrite static R0/R1/R2 in *cycle_frame* with adaptive values.
-
-    Every downstream consumer (parameter plots, impedance validation,
-    Nyquist, Bode, R0-vs-impedance) sees physics-based adaptive values.
-    """
-    diagnostics: list[str] = []
-    if cycle_frame.empty or "r0" not in cycle_frame.columns or "cycle_index" not in cycle_frame.columns:
-        return cycle_frame, base_params, diagnostics
-
-    df = cycle_frame.copy()
-    soc_col = next((c for c in ["soc_mean", "soc"] if c in df.columns), None)
-    temp_col = next((c for c in ["temperature_mean_c", "cycle_temperature_mean_c", "temperature_c"] if c in df.columns), None)
-    soh_col = "soh" if "soh" in df.columns else None
-    current_col = next((c for c in ["current_mean_a", "cycle_current_mean_a", "current_a"] if c in df.columns), None)
-
-    soc_arr = df[soc_col].ffill().bfill().fillna(0.5).to_numpy(float) if soc_col else np.full(len(df), 0.5)
-    temp_arr = df[temp_col].ffill().bfill().fillna(25.0).to_numpy(float) if temp_col else np.full(len(df), 25.0)
-    soh_arr = df[soh_col].ffill().bfill().fillna(1.0).to_numpy(float) if soh_col else np.full(len(df), 1.0)
-
-    base_r0 = float(base_params.get("r0", 0.01))
-    base_r1 = float(base_params.get("r1", 0.01))
-    base_r2 = float(base_params.get("r2", 0.02))
-
-    raw_r0 = adaptive_r0(soc_arr, temp_arr, soh_arr, base_r0)
-
-    if current_col is not None:
-        abs_cur = np.abs(df[current_col].ffill().bfill().fillna(0.0).to_numpy(float))
-        raw_r0 = raw_r0 * (1.0 + 0.08 * np.clip(abs_cur - 1.0, 0.0, 5.0))
-
-    cycle_idx = df["cycle_index"].to_numpy(float)
-    if len(cycle_idx) > 1:
-        norm_cycle = (cycle_idx - cycle_idx.min()) / max(cycle_idx.max() - cycle_idx.min(), 1.0)
-        raw_r0 = raw_r0 * (1.0 + 0.15 * norm_cycle)
-
-    sort_idx = np.argsort(cycle_idx)
-    r0_smooth = _ema_smooth(raw_r0[sort_idx], span=5)
-    inv_idx = np.argsort(sort_idx)
-    r0_final = np.clip(r0_smooth[inv_idx], 1e-4, 2.0)
-
-    r0_ratio = r0_final / max(base_r0, 1e-9)
-    r1_final = np.clip(base_r1 * r0_ratio * 0.75, 1e-5, 1.0)
-    r2_final = np.clip(base_r2 * r0_ratio * 0.75, 1e-5, 1.0)
-
-    df["r0"] = r0_final
-    df["r1"] = r1_final
-    df["r2"] = r2_final
-
-    r0_std = float(np.std(r0_final))
-    r0_mean = float(np.mean(r0_final))
-    if r0_std < 1e-4:
-        diagnostics.append("R0 variance is unrealistically low.")
-    if r0_mean < 0.02:
-        diagnostics.append(f"Mean adaptive R0 ({r0_mean:.4f} \u03a9) is very low.")
-
-    imp_col = "estimated_impedance_ohm" if "estimated_impedance_ohm" in df.columns else None
-    if imp_col is not None:
-        imp_arr = pd.to_numeric(df[imp_col], errors="coerce").to_numpy(float)
-        valid = np.isfinite(imp_arr) & np.isfinite(r0_final)
-        if np.sum(valid) > 2:
-            corr = float(np.corrcoef(r0_final[valid], imp_arr[valid])[0, 1])
-            if np.isfinite(corr) and corr < 0.3:
-                diagnostics.append(f"Weak R0-impedance correlation ({corr:.2f}).")
-            over_mask = valid & (r0_final > imp_arr)
-            if np.mean(r0_final[valid] > imp_arr[valid]) > 0.1:
-                diagnostics.append("Adaptive R0 exceeds transient impedance in some cycles.")
-                df.loc[df.index[over_mask], "r0"] = imp_arr[over_mask]
-
-    updated_params = dict(base_params)
-    updated_params["r0"] = float(np.median(df["r0"].to_numpy(float)))
-    updated_params["r1"] = float(np.median(r1_final))
-    updated_params["r2"] = float(np.median(r2_final))
-    return df, updated_params, diagnostics
-
 
 def sanitize_ecm_impedance_params(
     params: dict[str, float],
@@ -998,7 +921,18 @@ def ecm_impedance_response(params: dict[str, float], frequencies_hz: np.ndarray,
 
 def build_impedance_validation(cycle_frame: pd.DataFrame, params: dict[str, float]) -> tuple[dict[str, object], go.Figure, go.Figure, pd.DataFrame]:
     frequencies = np.geomspace(0.1, 5000.0, 220)
-    clean_params, param_warnings = sanitize_ecm_impedance_params(params, cycle_frame)
+    
+    # Build clean_params directly from adaptive frame medians
+    clean_params = {
+        "r0": _finite_median(cycle_frame, "r0") or params.get("r0", 0.01),
+        "r1": _finite_median(cycle_frame, "r1") or params.get("r1", 0.01),
+        "r2": _finite_median(cycle_frame, "r2") or params.get("r2", 0.02),
+        "c1": _finite_median(cycle_frame, "c1") or params.get("c1", 2000.0),
+        "c2": _finite_median(cycle_frame, "c2") or params.get("c2", 4000.0),
+        "warburg_aw": params.get("warburg_aw", 0.015),
+    }
+    
+    clean_params, param_warnings = sanitize_ecm_impedance_params(clean_params, cycle_frame)
     z_model = ecm_impedance_response(clean_params, frequencies)
     z_real = np.real(z_model)
     z_imag = np.imag(z_model)
@@ -1091,7 +1025,13 @@ def build_impedance_validation(cycle_frame: pd.DataFrame, params: dict[str, floa
             "insights": insights,
         }
     )
-    exp_imp_med = _finite_median(cycle_frame, "estimated_impedance_ohm")
+    imp_col = (
+        "estimated_impedance_smoothed_ohm"
+        if "estimated_impedance_smoothed_ohm" in cycle_frame.columns
+        else "estimated_impedance_ohm"
+    )
+    exp_imp_med = _finite_median(cycle_frame, imp_col)
+    
     if exp_imp_med is not None and exp_imp_med > 0:
         metrics["impedance_scaling_error"] = float(abs(total_r - exp_imp_med) / exp_imp_med * 100.0)
         metrics["r0_tracking_error"] = float(abs(clean_params["r0"] - exp_imp_med) / exp_imp_med * 100.0)
@@ -1331,14 +1271,7 @@ def main() -> None:
     ].copy()
     selected_ecm_params = battery_ecm_params.get(selected_battery, ecm_params)
 
-    # ====== ADAPTIVE ECM: overwrite static R0/R1/R2 with physics-based values ======
-    battery_cycle_shadow, _, _ = apply_adaptive_ecm_to_cycles(
-        battery_cycle_shadow, selected_ecm_params,
-    )
-    detail_cycle_shadow, selected_ecm_params, adaptive_diagnostics = apply_adaptive_ecm_to_cycles(
-        detail_cycle_shadow, selected_ecm_params,
-    )
-    # ================================================================================
+    adaptive_diagnostics = []
 
     physics_shadow = add_physics_features(detail_shadow, ocv_curve, selected_ecm_params)
     efficiency_table = compute_efficiency_trends(compute_cycle_efficiency(detail_shadow))
@@ -1841,8 +1774,13 @@ def main() -> None:
             
         if not imp_curve_batt.empty:
             st.markdown("#### R0 vs Estimated Impedance")
+            imp_col = (
+                "estimated_impedance_smoothed_ohm"
+                if "estimated_impedance_smoothed_ohm" in imp_curve_batt.columns
+                else "estimated_impedance_ohm"
+            )
             r0_fig = px.line(
-                imp_curve_batt, x="cycle_index", y=["r0", "estimated_impedance_ohm"],
+                imp_curve_batt, x="cycle_index", y=["r0", imp_col],
                 title="ECM R0 vs Transient Impedance",
                 labels={"cycle_index": "Cycle", "value": "Resistance (Ω)"}
             )

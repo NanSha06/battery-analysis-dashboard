@@ -1,22 +1,22 @@
 {
   "B0005": {
-    "growth_rate": 8.280076763646536e-06,
-    "max_impedance": 0.17154430177138694,
-    "drift_percent": -6.985339992150376
+    "growth_rate": 2.650997616891315e-05,
+    "max_impedance": 0.13739231614464173,
+    "drift_percent": -34.1701271276403
   },
   "B0006": {
-    "growth_rate": 9.273534724570411e-05,
-    "max_impedance": 0.21756836902360793,
-    "drift_percent": 3.2684252911209124
+    "growth_rate": 0.00010272478895435856,
+    "max_impedance": 0.18713168623636442,
+    "drift_percent": -23.707384497941344
   },
   "B0007": {
-    "growth_rate": 5.62783316187334e-05,
-    "max_impedance": 0.2961135351877987,
-    "drift_percent": -28.209713439537182
+    "growth_rate": 6.35731591889408e-05,
+    "max_impedance": 0.2028882741551941,
+    "drift_percent": -48.118276308646415
   },
   "B0018": {
-    "growth_rate": 1.575154790255369e-05,
-    "max_impedance": 0.18852143168740676,
-    "drift_percent": -2.495963920635462
+    "growth_rate": 3.770642405368976e-05,
+    "max_impedance": 0.14858096183553718,
+    "drift_percent": -28.099136585038657
   }
 }

@@ -1,30 +1,30 @@
 {
   "B0005": {
-    "mae": 0.027158394214539344,
-    "rmse": 0.028919478644834976,
-    "correlation": NaN,
+    "mae": 0.0399132117271477,
+    "rmse": 0.040198179901995125,
+    "correlation": 0.8331686416810363,
     "trend_consistency": 1.0,
-    "drift_percent": -6.985339992150376
+    "drift_percent": -34.1701271276403
   },
   "B0006": {
-    "mae": 0.03933934325644086,
-    "rmse": 0.0412441609696118,
-    "correlation": NaN,
+    "mae": 0.031753749506897196,
+    "rmse": 0.03558151063311595,
+    "correlation": 0.8068203720743264,
     "trend_consistency": 1.0,
-    "drift_percent": 3.2684252911209124
+    "drift_percent": -23.707384497941344
   },
   "B0007": {
-    "mae": 0.0607691278101866,
-    "rmse": 0.08177679310636564,
-    "correlation": NaN,
+    "mae": 0.06923890865453002,
+    "rmse": 0.07240750127824631,
+    "correlation": 0.5489706711723148,
     "trend_consistency": 1.0,
-    "drift_percent": -28.209713439537182
+    "drift_percent": -48.118276308646415
   },
   "B0018": {
-    "mae": 0.04098259827752634,
-    "rmse": 0.04175916211081976,
-    "correlation": NaN,
-    "trend_consistency": 0.0,
-    "drift_percent": -2.495963920635462
+    "mae": 0.03533655877924771,
+    "rmse": 0.035858607688396035,
+    "correlation": 0.7664607697627487,
+    "trend_consistency": 1.0,
+    "drift_percent": -28.099136585038657
   }
 }

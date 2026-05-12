@@ -431,14 +431,33 @@ def attach_ecm_state(
 
     ocv_curve = estimate_ocv_curve(sample_table)
     params = fit_2rc_parameters(sample_table, ocv_curve)
+    
+    soh_series = sample_table["soh"].ffill().bfill().fillna(1.0) if "soh" in sample_table.columns else pd.Series(1.0, index=sample_table.index)
+    dynamic_params = get_dynamic_params(
+        sample_table["soc"].ffill().bfill().fillna(0.5),
+        sample_table["temperature_c"].ffill().bfill().fillna(25.0),
+        soh_series,
+        params,
+    )
+    
+    r0_arr = dynamic_params["r0_dynamic"].to_numpy(dtype=float)
+
     simulated = simulate_2rc_ecm(
         current_a=sample_table["current_a"].fillna(0.0).to_numpy(dtype=float),
         dt_s=sample_table["dt_s"].fillna(0.0).to_numpy(dtype=float),
         soc=sample_table["soc"].ffill().fillna(0.5).to_numpy(dtype=float),
         params=params,
         ocv_curve=ocv_curve,
+        r0_override=r0_arr,
     )
     frame = sample_table.copy()
+    
+    frame["r0"] = dynamic_params["r0_dynamic"]
+    frame["r1"] = dynamic_params["r1_dynamic"]
+    frame["r2"] = dynamic_params["r2_dynamic"]
+    frame["c1"] = dynamic_params["c1_dynamic"]
+    frame["c2"] = dynamic_params["c2_dynamic"]
+    
     frame = pd.concat([frame.reset_index(drop=True), simulated.reset_index(drop=True)], axis=1)
     frame["voltage_error_v"] = frame["voltage_model_v"] - frame["voltage_v"]
     if run_ekf:
@@ -448,6 +467,7 @@ def attach_ecm_state(
             ocv_curve=ocv_curve,
             nominal_capacity_ah=nominal_capacity_ah,
             ekf_params=ekf_params,
+            r0_override=r0_arr,
         )
     return frame, params, ocv_curve
 
@@ -475,12 +495,23 @@ def estimate_cycle_ecm_parameters(
 
         ocv_curve = estimate_ocv_curve(working_group)
         params = fit_2rc_parameters(working_group, ocv_curve)
+        
+        soh_series = working_group["soh"].ffill().bfill().fillna(1.0) if "soh" in working_group.columns else pd.Series(1.0, index=working_group.index)
+        dynamic_params = get_dynamic_params(
+            working_group["soc"].ffill().bfill().fillna(0.5),
+            working_group["temperature_c"].ffill().bfill().fillna(25.0),
+            soh_series,
+            params,
+        )
+        r0_arr = dynamic_params["r0_dynamic"].to_numpy(dtype=float)
+
         simulated = simulate_2rc_ecm(
             current_a=working_group["current_a"].fillna(0.0).to_numpy(dtype=float),
             dt_s=working_group["dt_s"].fillna(0.0).to_numpy(dtype=float),
             soc=working_group["soc"].ffill().fillna(0.5).to_numpy(dtype=float),
             params=params,
             ocv_curve=ocv_curve,
+            r0_override=r0_arr,
         )
         enriched = pd.concat([working_group.reset_index(drop=True), simulated.reset_index(drop=True)], axis=1)
         enriched["voltage_error_v"] = enriched["voltage_model_v"] - enriched["voltage_v"]
@@ -493,11 +524,11 @@ def estimate_cycle_ecm_parameters(
                 "cycle_type": cycle_type,
                 "operation_number": float(group["operation_number"].iloc[0]) if "operation_number" in group else np.nan,
                 "discharge_number": float(group["discharge_number"].iloc[0]) if "discharge_number" in group else np.nan,
-                "r0": float(params.r0),
-                "r1": float(params.r1),
-                "c1": float(params.c1),
-                "r2": float(params.r2),
-                "c2": float(params.c2),
+                "r0": float(dynamic_params["r0_dynamic"].median()),
+                "r1": float(dynamic_params["r1_dynamic"].median()),
+                "c1": float(dynamic_params["c1_dynamic"].median()),
+                "r2": float(dynamic_params["r2_dynamic"].median()),
+                "c2": float(dynamic_params["c2_dynamic"].median()),
                 "cycle_voltage_mean_v": float(group["voltage_v"].mean()) if "voltage_v" in group else np.nan,
                 "cycle_current_mean_a": float(group["current_a"].mean()) if "current_a" in group else np.nan,
                 "cycle_temperature_mean_c": float(group["temperature_c"].mean()) if "temperature_c" in group else np.nan,
