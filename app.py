@@ -328,6 +328,103 @@ def build_parameter_signal_plot(
     return fig
 
 
+
+def build_battery_level_ecm_plot(
+    cycle_shadow,
+    battery_ids,
+):
+    """Build a 5-subplot figure showing R0, R1, R2, C1, C2 vs cycle_index
+    for each battery in *battery_ids*, aggregated from cycle_shadow.
+
+    Each series is clipped to realistic ranges and smoothed with a rolling
+    mean (window=5) to highlight lifecycle trends without per-sample noise.
+    """
+    params = [
+        ("r0", "R0", "Ohm", 1e-5, 2.0),
+        ("r1", "R1", "Ohm", 1e-5, 2.0),
+        ("r2", "R2", "Ohm", 1e-5, 2.0),
+        ("c1", "C1", "Farad", 1.0, 100_000.0),
+        ("c2", "C2", "Farad", 1.0, 100_000.0),
+    ]
+
+    _palette = [
+        "#58a6ff", "#3fb950", "#f2cc60", "#ff7b72",
+        "#d2a8ff", "#79c0ff", "#56d364", "#ffa657",
+    ]
+
+    fig = make_subplots(
+        rows=5,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.055,
+        subplot_titles=[f"{p[1]} ({p[2]})" for p in params],
+    )
+
+    smooth_window = 5
+
+    for b_idx, battery_id in enumerate(battery_ids):
+        color = _palette[b_idx % len(_palette)]
+        batt_df = cycle_shadow[
+            (cycle_shadow["battery_id"] == battery_id)
+            & (cycle_shadow["cycle_type"] == "discharge")
+        ].copy()
+        if batt_df.empty:
+            continue
+        batt_df = batt_df.sort_values("cycle_index")
+
+        for row_idx, (col, label, unit, lo, hi) in enumerate(params, start=1):
+            if col not in batt_df.columns:
+                continue
+            s = pd.to_numeric(batt_df[col], errors="coerce").clip(lower=lo, upper=hi)
+            s_smooth = s.rolling(window=smooth_window, min_periods=1).mean()
+
+            fmt = ".6f" if unit == "Ohm" else ".1f"
+            hover = (
+                f"{battery_id}<br>"
+                "Cycle %{x}<br>"
+                f"{label}: %{{y:{fmt}}} {unit}<extra></extra>"
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=batt_df["cycle_index"].values,
+                    y=s_smooth.values,
+                    mode="lines",
+                    name=battery_id,
+                    legendgroup=battery_id,
+                    showlegend=(row_idx == 1),
+                    line={"color": color, "width": 2},
+                    hovertemplate=hover,
+                ),
+                row=row_idx,
+                col=1,
+            )
+
+    fig.update_layout(
+        title="Battery-Level ECM Parameter Trends (discharge cycles, rolling-mean smoothed)",
+        height=160 * len(params) + 120,
+        hovermode="x unified",
+        legend_title_text="Battery",
+        margin={"l": 20, "r": 20, "t": 80, "b": 40},
+        plot_bgcolor="rgba(13,17,23,1)",
+        paper_bgcolor="rgba(13,17,23,1)",
+        font={"color": "#c9d1d9"},
+    )
+    fig.update_xaxes(
+        title_text="Cycle Index",
+        row=len(params),
+        col=1,
+        gridcolor="rgba(48,54,61,1)",
+    )
+    for i, (_, _, unit, _, _) in enumerate(params, start=1):
+        fig.update_yaxes(
+            title_text=unit,
+            row=i,
+            col=1,
+            rangemode="tozero",
+            gridcolor="rgba(48,54,61,1)",
+        )
+    return fig
+
 def format_kpi_value(value: float | int | None, suffix: str = "", digits: int = 3) -> str:
     if value is None or pd.isna(value):
         return "n/a"
@@ -1680,6 +1777,37 @@ def main() -> None:
                 st.plotly_chart(uncertainty_soc_fig, use_container_width=True)
 
     with parameters_tab:
+        # ── Battery-Level ECM Parameter Trends ──────────────────────────────
+        st.markdown("### Battery-Level ECM Parameter Trends")
+        batt_ecm_selection = st.multiselect(
+            "Batteries to include",
+            options=battery_ids,
+            default=battery_ids,
+            key="batt_ecm_selection",
+            help="Choose which batteries appear in the cross-battery comparison chart.",
+        )
+        if not batt_ecm_selection:
+            st.info("Select at least one battery to render the cross-battery ECM chart.")
+        else:
+            ecm_missing = [
+                col for col in ["r0", "r1", "r2", "c1", "c2"]
+                if col not in cycle_shadow.columns
+            ]
+            if ecm_missing:
+                st.warning(
+                    f"ECM columns not found in cycle_shadow: {ecm_missing}. "
+                    "Re-run the pipeline to generate them."
+                )
+            else:
+                battery_level_ecm_fig = build_battery_level_ecm_plot(
+                    cycle_shadow, batt_ecm_selection
+                )
+                st.plotly_chart(battery_level_ecm_fig, use_container_width=True)
+
+        st.divider()
+
+        # ── Cycle-Level ECM Parameters (Selected Battery) ────────────────────
+        st.markdown("### Cycle-Level ECM Parameters (Selected Battery)")
         if detail_cycle_shadow.empty:
             st.info("No cycle-level rows were found for the selected cycle range.")
         else:
