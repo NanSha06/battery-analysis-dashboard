@@ -7,7 +7,7 @@ from sklearn.preprocessing import OneHotEncoder
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import LeaveOneGroupOut
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel, Matern, DotProduct
 from kneed import KneeLocator
 from scipy.optimize import curve_fit
 
@@ -100,11 +100,16 @@ def fit_gpr_rul(discharge_df: pd.DataFrame, soh_threshold: float = 0.80) -> dict
 
     kernel = (
         ConstantKernel(1.0, (1e-3, 1e3))
-        * RBF(length_scale=50, length_scale_bounds=(10, 500))
+        * Matern(length_scale=50, length_scale_bounds=(5, 500), nu=1.5)
+        + DotProduct(sigma_0=0.0, sigma_0_bounds="fixed")
         + WhiteKernel(noise_level=1e-4, noise_level_bounds=(1e-8, 1e-1))
     )
-    gpr = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3,
-                                   normalize_y=True)
+    gpr = GaussianProcessRegressor(
+        kernel=kernel,
+        n_restarts_optimizer=5,
+        normalize_y=True,
+        alpha=1e-6,
+    )
     gpr.fit(X, y)
 
     # Predict SOH out to 2x the current max cycle
@@ -161,6 +166,71 @@ def fit_gpr_rul(discharge_df: pd.DataFrame, soh_threshold: float = 0.80) -> dict
         "rul_mc_p25": rul_mc_p25,
         "rul_mc_p75": rul_mc_p75,
         "rul_mc_p95": rul_mc_p95,
+        "eol_median": eol_median,
+    }
+
+
+def fit_segmented_gpr_rul(
+    discharge_df: pd.DataFrame,
+    knee_cycle: int,
+    soh_threshold: float = 0.80,
+) -> dict:
+    """Fit separate GPR models before and after the degradation knee.
+
+    The post-knee segment has fewer points and a steeper slope; a dedicated
+    fit with a shorter length-scale captures it far better than a global GPR.
+    """
+    df = discharge_df.dropna(subset=["soh"]).copy()
+
+    pre = df[df["cycle_index"] < knee_cycle]
+    post = df[df["cycle_index"] >= knee_cycle]
+
+    if len(post) < 5:
+        # Not enough post-knee data - fall back to global GPR
+        return fit_gpr_rul(df, soh_threshold=soh_threshold)
+
+    # Post-knee kernel: shorter length-scale, no DotProduct (already trending)
+    post_kernel = (
+        ConstantKernel(1.0, (1e-3, 1e3))
+        * Matern(length_scale=15, length_scale_bounds=(2, 100), nu=1.5)
+        + WhiteKernel(noise_level=1e-4, noise_level_bounds=(1e-8, 1e-1))
+    )
+    gpr_post = GaussianProcessRegressor(
+        kernel=post_kernel, n_restarts_optimizer=5, normalize_y=True, alpha=1e-6
+    )
+    X_post = post["cycle_index"].values.reshape(-1, 1)
+    y_post = post["soh"].values
+    gpr_post.fit(X_post, y_post)
+
+    # Project from the knee onwards
+    max_cycle = int(df["cycle_index"].max())
+    future = np.arange(knee_cycle, max_cycle * 2).reshape(-1, 1)
+    soh_p, soh_s = gpr_post.predict(future, return_std=True)
+
+    def _eol(curve: np.ndarray) -> int:
+        below = np.where(curve <= soh_threshold)[0]
+        return int(future[below[0]]) if len(below) else int(future[-1])
+
+    eol_median = _eol(soh_p)
+    eol_p10 = _eol(soh_p - 1.28 * soh_s)
+    eol_p90 = _eol(soh_p + 1.28 * soh_s)
+
+    # Monte Carlo
+    n_samples = 500
+    soh_mc = np.random.normal(soh_p.reshape(-1, 1), soh_s.reshape(-1, 1),
+                              (len(future), n_samples))
+    mc_eols = [_eol(soh_mc[:, s]) for s in range(n_samples)]
+    mc_eols = np.array(mc_eols)
+
+    current_cycles = df["cycle_index"].values
+    return {
+        "rul_median": np.maximum(eol_median - current_cycles, 0),
+        "rul_p10": np.maximum(eol_p10 - current_cycles, 0),
+        "rul_p90": np.maximum(eol_p90 - current_cycles, 0),
+        "rul_mc_p5": np.maximum(np.percentile(mc_eols, 5) - current_cycles, 0),
+        "rul_mc_p25": np.maximum(np.percentile(mc_eols, 25) - current_cycles, 0),
+        "rul_mc_p75": np.maximum(np.percentile(mc_eols, 75) - current_cycles, 0),
+        "rul_mc_p95": np.maximum(np.percentile(mc_eols, 95) - current_cycles, 0),
         "eol_median": eol_median,
     }
 
@@ -311,17 +381,6 @@ def add_rul_estimates(
         frame.loc[mask, "estimated_eol_cycle"] = eol_cycle
         frame.loc[mask, "rul_cycles"] = eol_cycle - frame.loc[mask, "cycle_index"]
         
-        # GPR RUL
-        gpr_results = fit_gpr_rul(group, soh_threshold=soh_threshold)
-        if gpr_results:
-            frame.loc[mask, "rul_cycles_gpr"] = gpr_results["rul_median"]
-            frame.loc[mask, "rul_p10"] = gpr_results["rul_p10"]
-            frame.loc[mask, "rul_p90"] = gpr_results["rul_p90"]
-            frame.loc[mask, "rul_mc_p5"] = gpr_results["rul_mc_p5"]
-            frame.loc[mask, "rul_mc_p25"] = gpr_results["rul_mc_p25"]
-            frame.loc[mask, "rul_mc_p75"] = gpr_results["rul_mc_p75"]
-            frame.loc[mask, "rul_mc_p95"] = gpr_results["rul_mc_p95"]
-
         # 3. Knee-point Detection
         if len(group) > 20:
             try:
@@ -348,6 +407,29 @@ def add_rul_estimates(
                                 frame.loc[mask.values & past_knee_mask.values, "rul_cycles"] = np.maximum(eol_past - current_cycles[past_knee_mask], 0)
             except:
                 pass
+
+        # GPR RUL
+        knee_val = frame.loc[mask, "knee_cycle"].dropna()
+        if not knee_val.empty and np.isfinite(knee_val.iloc[0]):
+            gpr_results = fit_segmented_gpr_rul(group, int(knee_val.iloc[0]), soh_threshold)
+        else:
+            gpr_results = fit_gpr_rul(group, soh_threshold=soh_threshold)
+        if gpr_results:
+            frame.loc[mask, "rul_cycles_gpr"] = gpr_results["rul_median"]
+            frame.loc[mask, "rul_p10"] = gpr_results["rul_p10"]
+            frame.loc[mask, "rul_p90"] = gpr_results["rul_p90"]
+            frame.loc[mask, "rul_mc_p5"] = gpr_results["rul_mc_p5"]
+            frame.loc[mask, "rul_mc_p25"] = gpr_results["rul_mc_p25"]
+            frame.loc[mask, "rul_mc_p75"] = gpr_results["rul_mc_p75"]
+            frame.loc[mask, "rul_mc_p95"] = gpr_results["rul_mc_p95"]
+
+            if "mean_soc_ekf_std" in frame.columns:
+                ekf_std_series = frame.loc[mask, "mean_soc_ekf_std"].fillna(0.0)
+                ekf_scale = float(1.0 + 2.0 * ekf_std_series.mean())
+                frame.loc[mask, "rul_p10"] = gpr_results["rul_p10"] / ekf_scale
+                frame.loc[mask, "rul_p90"] = gpr_results["rul_p90"] * ekf_scale
+                frame.loc[mask, "rul_mc_p5"] = gpr_results["rul_mc_p5"] / ekf_scale
+                frame.loc[mask, "rul_mc_p95"] = gpr_results["rul_mc_p95"] * ekf_scale
 
         # 4. Arrhenius Model
         if "temperature_mean_c" in group:

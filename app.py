@@ -1220,6 +1220,40 @@ def main() -> None:
                     if bid in low_sop: risks.append("Low SOP (Power Fade)")
                     st.markdown(f"- **{bid}**: {', '.join(risks)}")
 
+        with st.expander("Power & Plating Diagnostics", expanded=True):
+            safety_frame = cycle_shadow[cycle_shadow["battery_id"] == selected_battery].copy()
+            safety_frame = safety_frame.sort_values("cycle_index")
+            safety_cols = st.columns(2)
+            with safety_cols[0]:
+                if "sop_w" in safety_frame.columns and safety_frame["sop_w"].notna().any():
+                    sop_fig = px.line(
+                        safety_frame.dropna(subset=["sop_w"]),
+                        x="cycle_index",
+                        y="sop_w",
+                        color="cycle_type" if "cycle_type" in safety_frame.columns else None,
+                        title=f"State of Power: {selected_battery}",
+                        labels={"cycle_index": "Cycle", "sop_w": "SOP (W)", "cycle_type": "Cycle Type"},
+                    )
+                    sop_fig.update_layout(height=360, hovermode="x unified")
+                    st.plotly_chart(sop_fig, use_container_width=True)
+                else:
+                    st.info("No State of Power values are available for the selected battery.")
+            with safety_cols[1]:
+                if "plating_risk" in safety_frame.columns and safety_frame["plating_risk"].notna().any():
+                    plating_fig = px.line(
+                        safety_frame.dropna(subset=["plating_risk"]),
+                        x="cycle_index",
+                        y="plating_risk",
+                        color="cycle_type" if "cycle_type" in safety_frame.columns else None,
+                        title=f"Lithium Ion Plating Risk: {selected_battery}",
+                        labels={"cycle_index": "Cycle", "plating_risk": "Risk Index", "cycle_type": "Cycle Type"},
+                    )
+                    plating_fig.update_yaxes(range=[0, max(0.05, float(safety_frame["plating_risk"].max()) * 1.15)])
+                    plating_fig.update_layout(height=360, hovermode="x unified")
+                    st.plotly_chart(plating_fig, use_container_width=True)
+                else:
+                    st.info("No lithium ion plating risk values are available for the selected battery.")
+
 
         st.markdown("### Global Validation Summary")
         val_rmse_v = ecm_metrics.get("mean_rmse_v", np.nan)

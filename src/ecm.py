@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import least_squares
+
+from .state_estimators import estimate_soc_ocv
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -27,15 +32,77 @@ class EKFParameters:
     initial_cov_v2: float = 1e-2
 
 
-def estimate_ocv_curve(sample_table: pd.DataFrame, soc_col: str = "soc") -> pd.DataFrame:
-    usable = sample_table.dropna(subset=[soc_col, "voltage_v"]).copy()
+def clip_with_warn(
+    values: np.ndarray,
+    low: float,
+    high: float,
+    name: str,
+    warn_fraction: float = 0.05,
+) -> np.ndarray:
+    """np.clip that logs a warning when >warn_fraction of values are clipped."""
+    clipped = np.clip(values, low, high)
+    n_clipped = int(np.sum((values < low) | (values > high)))
+    if n_clipped > warn_fraction * len(values):
+        _log.warning(
+            "%s: %.1f%% of values (%d/%d) clipped to [%g, %g]. "
+            "Check upstream model or data.",
+            name, 100.0 * n_clipped / len(values), n_clipped, len(values), low, high,
+        )
+    return clipped
+
+
+def estimate_ocv_curve(
+    sample_table: pd.DataFrame,
+    soc_col: str = "soc",
+    low_current_threshold_a: float = 0.15,
+    n_bins: int = 20,
+) -> pd.DataFrame:
+    """Build an OCV-SOC curve from near-rest samples only.
+
+    Strategy:
+      1. Keep only samples where |I| < low_current_threshold_a to suppress
+         ohmic-drop contamination.
+      2. Build separate charge and discharge OCV curves.
+      3. Return the average of the two - this is the standard hysteresis-
+         corrected estimate used in BMS literature.
+      4. Fall back to all samples if insufficient low-current data exists.
+    """
+    working = sample_table.copy()
+    if "current_a" not in working:
+        working["current_a"] = 0.0
+    usable = working.dropna(subset=[soc_col, "voltage_v", "current_a"]).copy()
     if usable.empty:
         return pd.DataFrame(columns=["soc", "ocv_v"])
 
-    usable["soc_bin"] = np.clip((usable[soc_col] * 20).round() / 20.0, 0.0, 1.0)
-    ocv_curve = usable.groupby("soc_bin", as_index=False)["voltage_v"].median()
-    ocv_curve.columns = ["soc", "ocv_v"]
-    return ocv_curve.sort_values("soc").reset_index(drop=True)
+    low_current = usable[usable["current_a"].abs() <= low_current_threshold_a]
+    if len(low_current) < 20:
+        low_current = usable
+
+    def _curve(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df["soc_bin"] = np.clip((df[soc_col] * n_bins).round() / n_bins, 0.0, 1.0)
+        curve = (
+            df.groupby("soc_bin", as_index=False)["voltage_v"]
+            .median()
+            .rename(columns={"voltage_v": "ocv_v", "soc_bin": "soc"})
+        )
+        return curve.sort_values("soc").reset_index(drop=True)
+
+    cycle_type = low_current.get("cycle_type", pd.Series(["discharge"] * len(low_current), index=low_current.index))
+    charge_data = low_current[cycle_type == "charge"]
+    discharge_data = low_current[cycle_type != "charge"]
+
+    has_charge = len(charge_data) >= 10
+    has_discharge = len(discharge_data) >= 10
+
+    if has_charge and has_discharge:
+        c_curve = _curve(charge_data)
+        d_curve = _curve(discharge_data)
+        merged = c_curve.merge(d_curve, on="soc", suffixes=("_c", "_d"), how="outer")
+        merged["ocv_v"] = merged[["ocv_v_c", "ocv_v_d"]].mean(axis=1)
+        return merged[["soc", "ocv_v"]].dropna().sort_values("soc").reset_index(drop=True)
+
+    return _curve(low_current)
 
 
 def interpolate_ocv(soc: np.ndarray, ocv_curve: pd.DataFrame) -> np.ndarray:
@@ -202,16 +269,31 @@ def get_adaptive_ecm_state(
     if imp_col in frame.columns:
         impedance = _finite_series(frame[imp_col], np.nan)
         valid = np.isfinite(impedance) & (impedance > 1e-5)
-        total_dynamic = np.clip(r0 + r1 + r2, 1e-6, None)
-        target_scale = np.ones(len(frame), dtype=float)
-        target_scale[valid] = np.clip(impedance[valid] / total_dynamic[valid], 0.35, 3.0)
-        r0 = r0 * (0.75 + 0.25 * target_scale)
-        r1 = r1 * (0.70 + 0.30 * target_scale)
-        r2 = r2 * (0.70 + 0.30 * target_scale)
+        if np.any(valid):
+            total_dynamic = np.clip(r0 + r1 + r2, 1e-9, None)
+            r1_r2 = np.clip(r1 + r2, 1e-9, None)
+            r1_share = np.clip(r1 / r1_r2, 0.05, 0.95)
 
-    r0 = np.clip(r0, 1e-4, 2.0)
-    r1 = np.clip(r1, 1e-5, 1.0)
-    r2 = np.clip(r2, 1e-5, 1.0)
+            total_target = np.clip(impedance, 0.02, 0.5)
+            r0_target = np.full(len(frame), np.nan, dtype=float)
+            if "re_ohm" in frame.columns:
+                re_values = pd.to_numeric(frame["re_ohm"], errors="coerce").to_numpy(dtype=float)
+                re_valid = np.isfinite(re_values) & (re_values > 1e-5)
+                r0_target[re_valid] = re_values[re_valid]
+
+            fallback_r0_fraction = np.clip(r0 / total_dynamic, 0.35, 0.55)
+            missing_r0 = ~np.isfinite(r0_target)
+            r0_target[missing_r0] = total_target[missing_r0] * fallback_r0_fraction[missing_r0]
+            r0_target = np.minimum(r0_target, total_target * 0.85)
+
+            polarization_target = np.clip(total_target - r0_target, 1e-5, None)
+            r0[valid] = r0_target[valid]
+            r1[valid] = polarization_target[valid] * r1_share[valid]
+            r2[valid] = polarization_target[valid] * (1.0 - r1_share[valid])
+
+    r0 = clip_with_warn(r0, 1e-4, 2.0, "R0")
+    r1 = clip_with_warn(r1, 1e-5, 1.0, "R1")
+    r2 = clip_with_warn(r2, 1e-5, 1.0, "R2")
     c1 = np.clip(c1, 1.0, 1e6)
     c2 = np.clip(c2, 1.0, 1e6)
     tau1 = r1 * c1
@@ -396,28 +478,108 @@ def _residuals(
 def fit_2rc_parameters(
     sample_table: pd.DataFrame,
     ocv_curve: pd.DataFrame,
+    n_starts: int = 6,
+    cost_threshold: float = 0.5,
 ) -> ECMParameters:
-    usable = sample_table.dropna(subset=["current_a", "dt_s", "soc", "voltage_v"]).copy()
-    if usable.empty:
-        return ECMParameters(0.01, 0.01, 2000.0, 0.02, 4000.0)
+    """Fit 2-RC ECM parameters with multi-start Huber-loss least_squares.
 
-    theta0 = np.asarray([0.01, 0.01, 2000.0, 0.02, 4000.0], dtype=float)
+    n_starts random initial guesses are tried; the result with the lowest
+    final cost is returned.  If all fits exceed cost_threshold the result is
+    still returned but a warning is emitted so the caller can decide whether
+    to fall back to a prior.
+    """
+    _DEFAULT = ECMParameters(0.01, 0.01, 2000.0, 0.02, 4000.0)
+    usable = sample_table.dropna(subset=["current_a", "dt_s", "soc", "voltage_v"]).copy()
+    if len(usable) < 10:
+        return _DEFAULT
+
     lower = np.asarray([1e-5, 1e-5, 1.0, 1e-5, 1.0], dtype=float)
     upper = np.asarray([1.0, 1.0, 1e6, 1.0, 1e6], dtype=float)
 
-    result = least_squares(
-        _residuals,
-        theta0,
-        bounds=(lower, upper),
-        args=(
+    rng = np.random.default_rng(42)
+    seeds = [np.asarray([0.01, 0.01, 2000.0, 0.02, 4000.0])]
+    for _ in range(n_starts - 1):
+        seeds.append(np.exp(rng.uniform(np.log(lower + 1e-12), np.log(upper))))
+
+    best_result = None
+    best_cost = np.inf
+
+    fit_args = (
             usable["current_a"].to_numpy(dtype=float),
             usable["dt_s"].to_numpy(dtype=float),
             usable["soc"].to_numpy(dtype=float),
             usable["voltage_v"].to_numpy(dtype=float),
             ocv_curve,
-        ),
     )
-    return ECMParameters(*result.x.tolist())
+
+    for theta0 in seeds:
+        try:
+            res = least_squares(
+                _residuals, theta0,
+                bounds=(lower, upper),
+                loss="huber", f_scale=0.05,
+                args=fit_args,
+                max_nfev=2000,
+            )
+            if res.cost < best_cost:
+                best_cost = res.cost
+                best_result = res
+        except Exception:
+            continue
+
+    if best_result is None:
+        return _DEFAULT
+
+    if best_cost > cost_threshold:
+        import warnings
+        warnings.warn(
+            f"fit_2rc_parameters: best fit cost {best_cost:.4f} exceeds threshold "
+            f"{cost_threshold}. Parameters may be unreliable.",
+            RuntimeWarning,
+        )
+
+    return ECMParameters(*best_result.x.tolist())
+
+
+def fit_per_bin_parameters(
+    sample_table: pd.DataFrame,
+    ocv_curve: pd.DataFrame,
+    nominal_capacity_ah: float = 2.0,
+    n_soc_bins: int = 5,
+    min_samples_per_bin: int = 30,
+) -> dict[tuple[float, float], ECMParameters]:
+    """Fit separate ECM parameters per (SOC-bin, cycle-quartile) stratum.
+
+    Returns a dict keyed by (soc_bin_center, cycle_quartile_label) so that
+    get_adaptive_ecm_state can interpolate instead of using one global fit.
+    Falls back to fit_2rc_parameters on bins with insufficient data.
+    """
+    result: dict[tuple[float, float], ECMParameters] = {}
+    fallback = fit_2rc_parameters(sample_table, ocv_curve)
+
+    usable = sample_table.dropna(subset=["current_a", "dt_s", "soc", "voltage_v"]).copy()
+    if usable.empty:
+        return {(0.5, 0): fallback}
+
+    bin_edges = np.linspace(0.0, 1.0, n_soc_bins + 1)
+    usable["_soc_bin"] = pd.cut(
+        usable["soc"].clip(0.0, 1.0),
+        bins=bin_edges,
+        labels=(bin_edges[:-1] + bin_edges[1:]) / 2,
+    )
+    cycle_quartiles = pd.qcut(
+        usable["cycle_index"], q=4, labels=[0, 1, 2, 3], duplicates="drop"
+    )
+    usable["_cycle_q"] = cycle_quartiles
+
+    for (soc_bin, cycle_q), group in usable.groupby(["_soc_bin", "_cycle_q"], observed=True):
+        key = (float(soc_bin), int(cycle_q))
+        if len(group) < min_samples_per_bin:
+            result[key] = fallback
+        else:
+            result[key] = fit_2rc_parameters(group, ocv_curve)
+
+    return result
 
 
 def run_ekf_soc_ocv(
@@ -491,6 +653,8 @@ def run_ekf_soc_ocv(
         
         innovation_history = []
         WARMUP = 50
+        _state_delta_history: list[np.ndarray] = []
+        _divergence_counter = [0]
 
         for i in range(len(group)):
             dt = max(float(dt_s[i]), 0.0)
@@ -509,6 +673,7 @@ def run_ekf_soc_ocv(
             v1_pred = float(a1 * x[1] + b1 * ik)
             v2_pred = float(a2 * x[2] + b2 * ik)
             x_pred = np.asarray([soc_pred, v1_pred, v2_pred], dtype=float)
+            _state_delta_history.append(np.abs(x_pred - x))
 
             f = np.asarray(
                 [
@@ -529,16 +694,34 @@ def run_ekf_soc_ocv(
                 innovation = float(voltage[i]) - h_val
                 innovation_history.append(innovation)
                 
-                # --- Adaptive EKF (Sage-Husa) ---
+                # --- Full Sage-Husa: adapt R and Q independently ---
                 if len(innovation_history) > WARMUP:
                     recent = np.array(innovation_history[-WARMUP:])
-                    R_adapted = float(np.var(recent) + (h_jacobian @ p_pred @ h_jacobian.T))
-                    r[0, 0] = max(R_adapted, 1e-6)
-                    
-                    # Scale Q proportionally
-                    q[0, 0] = max(r[0, 0] * 4e-4, 1e-8)
-                    q[1, 1] = max(r[0, 0] * 4e-3, 1e-7)
-                    q[2, 2] = max(r[0, 0] * 4e-3, 1e-7)
+
+                    # R: measurement noise - estimated from innovation variance
+                    r_adapted = float(np.var(recent) + float(h_jacobian @ p_pred @ h_jacobian.T))
+                    r[0, 0] = float(np.clip(r_adapted, 1e-6, 0.5))
+
+                    # Q: process noise - estimated from how much the state actually changed
+                    # Use a separate sliding window of state increments (||x - x_pred||^2)
+                    if len(_state_delta_history) > WARMUP:
+                        recent_deltas = np.array(_state_delta_history[-WARMUP:])
+                        q_soc = float(np.var(recent_deltas[:, 0]))
+                        q_v1 = float(np.var(recent_deltas[:, 1]))
+                        q_v2 = float(np.var(recent_deltas[:, 2]))
+                        q[0, 0] = float(np.clip(q_soc, 1e-10, 1e-4))
+                        q[1, 1] = float(np.clip(q_v1, 1e-9, 1e-3))
+                        q[2, 2] = float(np.clip(q_v2, 1e-9, 1e-3))
+
+                    # Divergence detector: normalised innovation > 3sigma for 10 consecutive steps
+                    nni = abs(innovation) / max(float(np.sqrt(float(h_jacobian @ p_pred @ h_jacobian.T) + r[0, 0])), 1e-9)
+                    _divergence_counter[0] = _divergence_counter[0] + 1 if nni > 3.0 else 0
+                    if _divergence_counter[0] >= 10:
+                        # Reset - re-seed SOC from OCV
+                        x[0] = float(np.clip(estimate_soc_ocv(np.array([voltage[i]]), ocv_curve)[0], 0.0, 1.0))
+                        p = np.diag([ekf_params.initial_cov_soc, ekf_params.initial_cov_v1, ekf_params.initial_cov_v2])
+                        _divergence_counter[0] = 0
+                        innovation_history.clear()
 
                 s = h_jacobian @ p_pred @ h_jacobian.T + r
                 k = p_pred @ h_jacobian.T @ np.linalg.pinv(s)

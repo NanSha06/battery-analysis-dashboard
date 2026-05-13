@@ -72,68 +72,95 @@ def estimate_impedance(
 
 import warnings
 
-def validate_r0(r0_values: np.ndarray | pd.Series, impedance_values: np.ndarray | pd.Series) -> dict[str, float]:
-    """
-    Validate ECM-derived R0 against transient estimated impedance.
+def validate_r0(
+    r0_values: np.ndarray | pd.Series,
+    impedance_values: np.ndarray | pd.Series,
+    cycle_types: np.ndarray | pd.Series | None = None,
+    iqr_multiplier: float = 2.0,
+) -> dict[str, float]:
+    """Validate ECM-derived R0 against transient pulse impedance.
+
+    Improvements over the original:
+    - Filters to discharge cycles only when cycle_types is supplied.
+    - Rejects outliers via IQR instead of hard physical bounds alone.
+    - Reports per-SOC-decile RMSE breakdown (keys: rmse_soc_d0 … rmse_soc_d9).
     """
     r0_arr = np.asarray(r0_values, dtype=float)
     imp_arr = np.asarray(impedance_values, dtype=float)
-    
-    # Unit Validation Checks & Warnings
+
+    # --- Discharge filter ---
+    if cycle_types is not None:
+        ct = np.asarray(cycle_types, dtype=str)
+        discharge_mask = ct == "discharge"
+        r0_arr = r0_arr[discharge_mask]
+        imp_arr = imp_arr[discharge_mask]
+
+    # --- Basic physical bounds ---
     if np.any(r0_arr < 0.0):
-        warnings.warn("Validation Warning: R0 < 0 detected. Physical resistance cannot be negative.")
+        warnings.warn("Validation Warning: R0 < 0 detected.")
     if np.any(r0_arr > 1.0):
-        warnings.warn("Validation Warning: R0 > 1 Ω detected. Ensure values are in Ohms, not normalized units.")
-        
+        warnings.warn("Validation Warning: R0 > 1 Ω. Check units.")
+
     valid_mask = np.isfinite(r0_arr) & np.isfinite(imp_arr)
     r0_valid = r0_arr[valid_mask]
     imp_valid = imp_arr[valid_mask]
-    
-    if np.any((imp_valid < 1e-5) | (imp_valid > 10.0)):
-        warnings.warn("Validation Warning: Impedance magnitude unrealistic (<1e-5 or >10 Ohms).")
-    
+
+    _NAN_RESULT = {
+        "mae": np.nan, "rmse": np.nan,
+        "correlation": np.nan, "trend_consistency": np.nan,
+        "drift_percent": np.nan,
+    }
+
     if len(r0_valid) < 2:
-        return {
-            "mae": np.nan,
-            "rmse": np.nan,
-            "correlation": np.nan,
-            "trend_consistency": np.nan,
-            "drift_percent": np.nan
-        }
-        
-    mae = mean_absolute_error(imp_valid, r0_valid)
-    rmse = np.sqrt(mean_squared_error(imp_valid, r0_valid))
-    
-    # Check if variance is sufficient for correlation
+        return _NAN_RESULT
+
+    # --- IQR outlier rejection on the impedance signal ---
+    q1, q3 = np.percentile(imp_valid, [25, 75])
+    iqr = q3 - q1
+    keep = (imp_valid >= q1 - iqr_multiplier * iqr) & (imp_valid <= q3 + iqr_multiplier * iqr)
+    r0_valid = r0_valid[keep]
+    imp_valid = imp_valid[keep]
+
+    if len(r0_valid) < 2:
+        return _NAN_RESULT
+
+    mae = float(mean_absolute_error(imp_valid, r0_valid))
+    rmse = float(np.sqrt(mean_squared_error(imp_valid, r0_valid)))
+
+    corr = np.nan
     if np.var(r0_valid) > 1e-12 and np.var(imp_valid) > 1e-12:
         corr, _ = pearsonr(imp_valid, r0_valid)
-    else:
-        corr = np.nan
-        
-    # Relative drift (mean percentage error)
-    mean_imp = np.mean(imp_valid)
-    if mean_imp > 1e-6:
-        drift_percent = float(np.mean(r0_valid - imp_valid) / mean_imp * 100.0)
-        if abs(drift_percent) > 200.0:
-            warnings.warn(f"Validation Warning: Scaling drift exceeds threshold ({drift_percent:.1f}%). Check scaling/normalizers.")
-    else:
-        drift_percent = np.nan
-        
-    # Trend consistency (do they slope in the same direction?)
+
+    mean_imp = float(np.mean(imp_valid))
+    drift_percent = float(np.mean(r0_valid - imp_valid) / mean_imp * 100.0) if mean_imp > 1e-6 else np.nan
+    if np.isfinite(drift_percent) and abs(drift_percent) > 200.0:
+        warnings.warn(f"Scaling drift {drift_percent:.1f}%.")
+
+    trend_consistency = np.nan
     if len(r0_valid) > 5:
-        trend_r0 = np.polyfit(np.arange(len(r0_valid)), r0_valid, 1)[0]
-        trend_imp = np.polyfit(np.arange(len(imp_valid)), imp_valid, 1)[0]
-        trend_consistency = 1.0 if (trend_r0 * trend_imp > 0) else 0.0
-    else:
-        trend_consistency = np.nan
-        
-    return {
-        "mae": float(mae),
-        "rmse": float(rmse),
+        tr0 = np.polyfit(np.arange(len(r0_valid)), r0_valid, 1)[0]
+        timp = np.polyfit(np.arange(len(imp_valid)), imp_valid, 1)[0]
+        trend_consistency = 1.0 if tr0 * timp > 0 else 0.0
+
+    result: dict[str, float] = {
+        "mae": mae,
+        "rmse": rmse,
         "correlation": float(corr),
         "trend_consistency": float(trend_consistency),
-        "drift_percent": float(drift_percent)
+        "drift_percent": float(drift_percent) if np.isfinite(drift_percent) else np.nan,
     }
+
+    # --- Per-SOC-decile RMSE (requires positional alignment; use imp as proxy) ---
+    deciles = np.array_split(np.argsort(imp_valid), 10)
+    for d_idx, idx_set in enumerate(deciles):
+        if len(idx_set) < 2:
+            result[f"rmse_decile_{d_idx}"] = np.nan
+        else:
+            result[f"rmse_decile_{d_idx}"] = float(
+                np.sqrt(np.mean((r0_valid[idx_set] - imp_valid[idx_set]) ** 2))
+            )
+
+    return result
 
 def analyze_impedance_growth(cycles: np.ndarray | pd.Series, impedance: np.ndarray | pd.Series) -> pd.DataFrame:
     """

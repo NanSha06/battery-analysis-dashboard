@@ -56,23 +56,35 @@ def estimate_soc_coulomb_counting(
     frame = add_sample_features(sample_table)
     frame["soc"] = np.nan
 
-    for (_, cycle_index), group in frame.groupby(["battery_id", "cycle_index"]):
+    for (battery_id, cycle_index), group in frame.groupby(["battery_id", "cycle_index"]):
         idx = group.index
         current = group["current_a"].fillna(0.0).to_numpy(dtype=float)
         dt_s = group["dt_s"].fillna(0.0).to_numpy(dtype=float)
+        voltage = group["voltage_v"].to_numpy(dtype=float)
         cycle_type = str(group["cycle_type"].iloc[0]).lower()
-        soc = np.zeros(len(group), dtype=float)
 
-        if cycle_type == "charge":
-            soc[0] = 0.1
-            direction = 1.0
-        else:
-            soc[0] = 1.0
-            direction = -1.0
+        # --- OCV-based SOC seed (replaces hard-coded 0.1 / 1.0) ---
+        v_first = float(voltage[0]) if np.isfinite(voltage[0]) else np.nan
+        soc_from_ocv = float(
+            np.interp(v_first,
+                      [3.0, 3.5, 3.7, 3.9, 4.0, 4.2],
+                      [0.0, 0.2, 0.5, 0.75, 0.9, 1.0])
+        ) if np.isfinite(v_first) else (0.1 if cycle_type == "charge" else 1.0)
+
+        soc = np.zeros(len(group), dtype=float)
+        soc[0] = float(np.clip(soc_from_ocv, 0.0, 1.0))
+
+        direction = 1.0 if cycle_type == "charge" else -1.0
 
         for i in range(1, len(group)):
             delta_ah = current[i] * dt_s[i] / 3600.0
-            soc[i] = np.clip(soc[i - 1] + direction * delta_ah / nominal_capacity_ah, 0.0, 1.0)
+            soc[i] = float(np.clip(soc[i - 1] + direction * delta_ah / nominal_capacity_ah, 0.0, 1.0))
+
+            # Cutoff-based drift correction: anchor to 0.0 / 1.0 at physical limits
+            if cycle_type == "discharge" and np.isfinite(voltage[i]) and voltage[i] <= 3.0:
+                soc[i] = 0.0
+            elif cycle_type == "charge" and np.isfinite(voltage[i]) and voltage[i] >= 4.2:
+                soc[i] = 1.0
 
         frame.loc[idx, "soc"] = soc
 

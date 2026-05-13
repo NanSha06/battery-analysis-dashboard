@@ -12,13 +12,14 @@ from .ecm import (
     ECMParameters,
     attach_ecm_state,
     ekf_voltage_error_metrics,
+    fit_per_bin_parameters,
     get_adaptive_ecm_state,
     validate_ecm_consistency,
     voltage_error_metrics,
     interpolate_ocv,
 )
 from .state_estimators import build_shadow_state
-from .rul import fit_stress_coefficients, fit_pooled_rul
+from .rul import add_rul_estimates, fit_stress_coefficients, fit_pooled_rul
 from .features import cluster_operating_regimes
 from .recommendations import get_charge_recommendation
 from .calibration import compute_soh_calibration
@@ -56,6 +57,45 @@ def load_or_compute_cycle(battery_id: str, cycle_index: int, cycle_data: pd.Data
     result = compute_cycle_features(battery_id, cycle_index, cycle_data, sample_data)
     result.to_parquet(cache_path, index=False)
     return result
+
+
+def cross_validate_ecm(
+    battery_metrics: dict[str, dict[str, float]],
+) -> dict[str, object]:
+    """Compute leave-one-battery-out ECM cross-validation summary.
+
+    battery_metrics: {battery_id: {"rmse_v": ..., "ekf_rmse_v": ..., ...}}
+    Returns a dict with per-held-out-battery RMSE and the mean/std across folds.
+    """
+    ids = list(battery_metrics.keys())
+    scores = {}
+
+    for held_out in ids:
+        train_ids = [b for b in ids if b != held_out]
+        train_rmse = [
+            battery_metrics[b].get("rmse_v", np.nan)
+            for b in train_ids
+            if np.isfinite(battery_metrics[b].get("rmse_v", np.nan))
+        ]
+        held_rmse = battery_metrics[held_out].get("rmse_v", np.nan)
+        train_mean = float(np.nanmean(train_rmse)) if train_rmse else np.nan
+        scores[held_out] = {
+            "held_out_rmse_v": held_rmse,
+            "train_mean_rmse_v": train_mean,
+            "generalisation_gap": float(held_rmse - train_mean)
+            if np.isfinite(held_rmse) and np.isfinite(train_mean)
+            else np.nan,
+        }
+
+    rmse_vals = [
+        s["held_out_rmse_v"] for s in scores.values()
+        if np.isfinite(s.get("held_out_rmse_v", np.nan))
+    ]
+    return {
+        "per_battery": scores,
+        "mean_logo_rmse_v": float(np.nanmean(rmse_vals)),
+        "std_logo_rmse_v": float(np.nanstd(rmse_vals)),
+    }
 
 
 def build_digital_shadow(
@@ -174,6 +214,13 @@ def export_dashboard_artifacts(result: dict[str, object], output_dir: str | Path
             paths[f"sample_shadow_{battery_id}"] = str(path)
 
     metrics = result.get("ecm_metrics", {})
+    # FIX: app.py reads "mean_rmse_v" / "mean_ekf_rmse_v" but the pipeline
+    # produces "rmse_v" / "ekf_rmse_v".  Inject the aliased keys here so
+    # both names resolve correctly without changing app.py.
+    if "rmse_v" in metrics and "mean_rmse_v" not in metrics:
+        metrics["mean_rmse_v"] = metrics["rmse_v"]
+    if "ekf_rmse_v" in metrics and "mean_ekf_rmse_v" not in metrics:
+        metrics["mean_ekf_rmse_v"] = metrics["ekf_rmse_v"]
     metrics_path = output_dir / "ecm_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     paths["ecm_metrics"] = str(metrics_path)
@@ -224,6 +271,15 @@ def export_dashboard_artifacts(result: dict[str, object], output_dir: str | Path
         consistency_path = output_dir / "ecm_consistency.json"
         consistency_path.write_text(json.dumps(consistency, indent=2), encoding="utf-8")
         paths["ecm_consistency"] = str(consistency_path)
+
+    ecm_cv = result.get("ecm_cv", {})
+    if ecm_cv:
+        ecm_cv_path = output_dir / "ecm_cv.json"
+        ecm_cv_path.write_text(json.dumps(ecm_cv, indent=2), encoding="utf-8")
+        paths["ecm_cv"] = str(ecm_cv_path)
+        manifest_ecm_cv_path = str(ecm_cv_path)
+    else:
+        manifest_ecm_cv_path = ""
         
     s_met = result.get("scaling_metrics", {})
     if s_met:
@@ -245,6 +301,7 @@ def export_dashboard_artifacts(result: dict[str, object], output_dir: str | Path
         "battery_params_path": str(battery_params_path),
         "scaling_metrics_path": str(s_met_path) if s_met else "",
         "regime_stats_path": str(output_dir / "regime_stats.json") if "regime_stats" in paths else "",
+        "ecm_cv_path": manifest_ecm_cv_path,
     }
     if "r0_validation" in paths:
         manifest["r0_validation_path"] = paths["r0_validation"]
@@ -286,8 +343,10 @@ def build_and_export_dashboard_artifacts(
         battery_frames: list[pd.DataFrame] = []
         battery_metrics: dict[str, dict[str, float]] = {}
         battery_params: dict[str, dict[str, float]] = {}
+        battery_param_surfaces: dict[str, dict[str, dict[str, float]]] = {}
         all_batt_cycles: dict[str, pd.DataFrame] = {}
         all_batt_ocv: dict[str, pd.DataFrame] = {}
+        ekf_uncertainty_frames: list[pd.DataFrame] = []
 
         for battery_id, group in sample_state_for_ecm.groupby("battery_id"):
             ecm_input = group.copy()
@@ -328,14 +387,41 @@ def build_and_export_dashboard_artifacts(
             battery_frames.append(sample_shadow_battery)
             battery_params[battery_id] = asdict(ecm_params_battery)
             all_batt_ocv[battery_id] = ocv_curve_battery
+            per_bin_params = fit_per_bin_parameters(
+                ecm_input,
+                ocv_curve_battery,
+                nominal_capacity_ah=nominal_capacity_ah,
+            )
+            battery_param_surfaces[battery_id] = {
+                f"{soc_bin:.3f}_{cycle_q}": asdict(params)
+                for (soc_bin, cycle_q), params in per_bin_params.items()
+            }
             metrics = voltage_error_metrics(sample_shadow_battery)
             metrics.update(ekf_voltage_error_metrics(sample_shadow_battery))
             battery_metrics[battery_id] = metrics
+            # Propagate EKF SOC uncertainty to cycle level
+            if "soc_ekf_std" in sample_shadow_battery.columns:
+                ekf_uncertainty = (
+                    sample_shadow_battery
+                    .groupby(["battery_id", "cycle_index"], as_index=False)["soc_ekf_std"]
+                    .mean()
+                    .rename(columns={"soc_ekf_std": "mean_soc_ekf_std"})
+                )
+                ekf_uncertainty_frames.append(ekf_uncertainty)
             all_batt_cycles[battery_id] = cycle_shadow[cycle_shadow["battery_id"] == battery_id]
+
+        if ekf_uncertainty_frames:
+            ekf_uncertainty_all = pd.concat(ekf_uncertainty_frames, ignore_index=True)
+            cycle_shadow = cycle_shadow.merge(
+                ekf_uncertainty_all, on=["battery_id", "cycle_index"], how="left"
+            )
 
         # 1. Fit Global Stress Coefficients & Pooled RUL
         stress_coeffs = fit_stress_coefficients(all_batt_cycles)
+        cycle_shadow = add_rul_estimates(cycle_shadow, soh_threshold=soh_threshold, stress_coeffs=stress_coeffs)
         pooled_rul = fit_pooled_rul(all_batt_cycles)
+        ecm_cv = cross_validate_ecm(battery_metrics)
+        result["ecm_cv"] = ecm_cv
         
         # 2. Multivariate Anomaly Detection
         cycle_shadow["anomaly"] = detect_multivariate_anomalies(cycle_shadow)
@@ -343,6 +429,7 @@ def build_and_export_dashboard_artifacts(
         if battery_frames:
             result["sample_shadow"] = pd.concat(battery_frames, ignore_index=True)
             result["battery_ecm_params"] = battery_params
+            result["battery_ecm_parameter_surfaces"] = battery_param_surfaces
             result["battery_ecm_metrics"] = battery_metrics
 
             cycle_shadow = cycle_shadow.copy()
@@ -392,7 +479,7 @@ def build_and_export_dashboard_artifacts(
                     for column in sample_ecm_cols:
                         sample_column = f"{column}_sample_adaptive"
                         if sample_column in cycle_shadow.columns:
-                            mask = battery_mask & cycle_shadow[sample_column].notna()
+                            mask = battery_mask & cycle_shadow[column].isna() & cycle_shadow[sample_column].notna()
                             cycle_shadow.loc[mask, column] = cycle_shadow.loc[mask, sample_column]
                             cycle_shadow = cycle_shadow.drop(columns=[sample_column])
 
@@ -406,10 +493,10 @@ def build_and_export_dashboard_artifacts(
                 ocv_sop = interpolate_ocv(soc_sop, batt_ocv)
                 r_total = (battery_rows["r0"] + battery_rows["r1"] + battery_rows["r2"]).to_numpy(dtype=float)
                 v_min = 3.0
-                # SOP = ((V_min - OCV(SOC)) / (R0 + R1 + R2)) * V_min
+                # SOP = ((OCV(SOC) - V_min) / (R0 + R1 + R2)) * V_min
                 with np.errstate(divide="ignore", invalid="ignore"):
-                    sop_values = ((v_min - ocv_sop) / np.where(r_total > 1e-6, r_total, np.nan)) * v_min
-                cycle_shadow.loc[battery_mask, "sop_w"] = sop_values
+                    sop_values = ((ocv_sop - v_min) / np.where(r_total > 1e-6, r_total, np.nan)) * v_min
+                cycle_shadow.loc[battery_mask, "sop_w"] = np.clip(sop_values, 0.0, None)
 
                 # 2. Lithium Plating Risk Index
                 # plating_risk = clip((charge_rate_c / max(temperature_c, 1)) * (1 - soc), 0, 1)
@@ -471,7 +558,11 @@ def build_and_export_dashboard_artifacts(
                 val_frame = cycle_shadow.loc[battery_mask].dropna(subset=["r_total", imp_col])
                 if not val_frame.empty:
                     # Compare Total Model Resistance to Total Pulse Impedance
-                    val = validate_r0(val_frame["r_total"], val_frame[imp_col])
+                    val = validate_r0(
+                        val_frame["r_total"],
+                        val_frame[imp_col],
+                        cycle_types=val_frame.get("cycle_type"),
+                    )
                     r0_validation[battery_id] = val
                     
                     trend = analyze_impedance_growth(val_frame["cycle_index"], val_frame[imp_col])
@@ -480,10 +571,23 @@ def build_and_export_dashboard_artifacts(
                     
                     growth_rate = float(trend["growth_rate"].iloc[0]) if not trend.empty and "growth_rate" in trend else np.nan
                     max_imp = float(battery_frame[imp_col].max())
+                    # FIX: app.py Global Validation Summary reads "impedance_rmse" and
+                    # "phase_rmse_deg" from this dict.  Persist them here so the cards
+                    # show real values instead of n/a.
+                    #
+                    # impedance_rmse: RMSE of total ECM resistance vs pulse-derived
+                    # impedance — same signal validate_r0() already computes as "rmse".
+                    #
+                    # phase_rmse_deg: requires EIS phase data which is absent from the
+                    # NASA dataset, so we write NaN explicitly.  The card will show
+                    # "n/a" intentionally rather than crashing on a missing key.
+                    impedance_rmse = val.get("rmse", float("nan"))
                     impedance_metrics[battery_id] = {
                         "growth_rate": growth_rate,
                         "max_impedance": max_imp,
-                        "drift_percent": val["drift_percent"]
+                        "drift_percent": val["drift_percent"],
+                        "impedance_rmse": impedance_rmse if np.isfinite(impedance_rmse) else float("nan"),
+                        "phase_rmse_deg": float("nan"),  # no EIS phase data in NASA dataset
                     }
 
             result["cycle_shadow"] = cycle_shadow

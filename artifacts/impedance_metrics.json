@@ -2,21 +2,21 @@
   "B0005": {
     "growth_rate": 1.891358521061713e-05,
     "max_impedance": 0.12698736929470547,
-    "drift_percent": -99.77554513340279
+    "drift_percent": 1.0597091656625973e-16
   },
   "B0006": {
     "growth_rate": 1.7239898238355192e-05,
     "max_impedance": 0.11619250899177082,
-    "drift_percent": -99.7476481269461
+    "drift_percent": 2.707549936013096e-16
   },
   "B0007": {
     "growth_rate": -1.7076476291810124e-05,
     "max_impedance": 0.11947274915270205,
-    "drift_percent": -99.74264250806677
+    "drift_percent": 4.056334667244894e-17
   },
   "B0018": {
     "growth_rate": -3.613765157976729e-05,
     "max_impedance": 0.13174411817376075,
-    "drift_percent": -99.78021557396005
+    "drift_percent": -1.7402582950660384e-16
   }
 }
